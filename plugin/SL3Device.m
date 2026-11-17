@@ -1721,9 +1721,9 @@ static bool usb_ensure_hid(void) {
     g_hbuf_in   = [NSMutableData dataWithLength:64];
     hid_read();
     refresh_hw_status();
-    /* Connected, and running firmware (only such a box is opened: find_sl3_service). */
+    /* Connected. (Only a box with firmware is opened, find_sl3_service; refresh_hw_status has set
+       boot mode if that firmware is Rane's loader.) */
     atomic_store(&g_hw_connected, true);
-    atomic_store(&g_boot_mode, false);
     return true;
 }
 
@@ -1765,6 +1765,11 @@ static void usb_release_audio(void) {
    failure, everything opened so far is released again. */
 static bool usb_open_all(void) {
     if (!usb_ensure_hid()) return false;
+    /* Rane's firmware loader holds the DSP in reset: there is no audio to stream. */
+    if (atomic_load(&g_boot_mode)) {
+        LOG("Not streaming: the SL 3 is running Rane's firmware loader, not its firmware");
+        return false;
+    }
     NSError *e = nil;
 
     /* Playback stays off until the capture handler starts it; clear the debug counters. */
@@ -2009,7 +2014,8 @@ static void connect_box(int attempt) {
     /* Open it; unless a stream is already running, set thru and the current rate. */
     pthread_mutex_lock(&g_mutex);
     bool ok = usb_ensure_hid();
-    if (ok && !atomic_load(&g_io_running)) {
+    /* (Not on Rane's firmware loader: it has no audio, and the firmware tools are using it.) */
+    if (ok && !atomic_load(&g_io_running) && !atomic_load(&g_boot_mode)) {
         set_usb_switches(false);
         send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
     }
