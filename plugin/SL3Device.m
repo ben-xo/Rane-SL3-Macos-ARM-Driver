@@ -26,6 +26,8 @@
 #import <CoreAudio/AudioServerPlugIn.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/usb/IOUSBLib.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/IOMessage.h>
 #import <IOUSBHost/IOUSBHost.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -2003,6 +2005,39 @@ static void relist_if_safety_changed(void) {
     });
 }
 
+/* When the box's DSP has booted, its firmware puts every deck on USB audio (firmware 2.31; 2.50 does
+   so at power-up) and sets the rate back to 44.1 kHz. The DSP boots after the box is configured, and
+   again after a USB suspend and resume (the Mac sleeping), so it can finish after connect_box has set
+   thru and the rate. A while after connecting, and after the Mac wakes, the driver checks: with nothing
+   streaming, every deck back on thru; and the rate the driver's. */
+#define SETTLE_CHECK_MS 2000
+static void settle_check(const char *why) {
+    if (!atomic_load(&g_box_present)) return;   /* unplugged meanwhile */
+    pthread_mutex_lock(&g_mutex);
+    if (usb_ensure_hid() && !atomic_load(&g_boot_mode)) {
+        uint8_t r[HID_REPORT_LEN];
+        /* Thru: only with nothing streaming (a stream has the decks on USB audio). */
+        if (!atomic_load(&g_io_running) && hid_cmd(SL3_CMD_GET_CONTROLS, NULL, 0, r, NULL)) {
+            note_controls(r + 5);
+            bool on_usb = false;
+            for (int d = 0; d < SL3_NDECKS; d++) if (r[5 + SL3_CTL_SOURCE_AT(d)]) on_usb = true;
+            if (on_usb) {
+                LOG("%{public}s: a deck was on USB audio with nothing streaming: back to thru", why);
+                set_usb_switches(false);
+            }
+        }
+        /* The rate, streaming or not. */
+        if (hid_cmd(SL3_CMD_GET_RATE, NULL, 0, r, NULL)) {
+            int sr = (r[5] << 8) | r[6];
+            if (sr != (int)g_sr) {
+                LOG("%{public}s: the box was at %d Hz: set to %.0f Hz", why, sr, g_sr);
+                send_hw_samplerate((int)g_sr);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_mutex);
+}
+
 /* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
    powers up with the Aux deck on USB audio, and every deck on USB audio when on external power), as
    at stream stop, so turntables
@@ -2024,6 +2059,9 @@ static void connect_box(int attempt) {
     pthread_mutex_unlock(&g_mutex);
     if (ok) {
         if (attempt > 0) LOG("Rane SL 3 opened on attempt %d", attempt + 1);
+        /* Check again once the DSP has surely booted (see settle_check). */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_CHECK_MS * NSEC_PER_MSEC), g_hotplug_q,
+                       ^{ settle_check("After connecting"); });
         return;
     }
     /* Refused: try again on the hot-plug queue shortly, up to CONNECT_TRIES times in all. */
@@ -2101,6 +2139,29 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
     if (was_published != device_published()) notify_device_list_changed();
 }
 
+/* System sleep and wake: after a wake the box's DSP boots again (see settle_check). Sleep itself is
+   always allowed. */
+static io_connect_t g_pm_root;
+static IONotificationPortRef g_pm_port;
+static io_object_t g_pm_notifier;
+static void on_power(void *refcon, io_service_t svc, natural_t msg, void *arg) {
+    switch (msg) {
+        case kIOMessageCanSystemSleep:
+        case kIOMessageSystemWillSleep:
+            IOAllowPowerChange(g_pm_root, (long)arg);
+            break;
+        case kIOMessageSystemHasPoweredOn:
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * SETTLE_CHECK_MS * NSEC_PER_MSEC), g_hotplug_q,
+                           ^{ settle_check("After the Mac woke"); });
+            break;
+    }
+}
+static void start_power_monitor(void) {
+    g_pm_root = IORegisterForSystemPower(NULL, &g_pm_port, on_power, &g_pm_notifier);
+    if (!g_pm_root) { LOG("System wake notifications could not be set up: thru and rate aren't checked after a wake"); return; }
+    IONotificationPortSetDispatchQueue(g_pm_port, g_hotplug_q);
+}
+
 /* Watch for the box being plugged in and unplugged, and handle one already attached. */
 static void start_hotplug_monitor(void) {
     /* A serial queue for hot-plug work, and an IOKit notification port that delivers onto it. */
@@ -2166,6 +2227,7 @@ static OSStatus SL3_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     mach_timebase_info(&g_tb);
     clk_reset();
     start_hotplug_monitor();
+    start_power_monitor();
     LOG("SL3Device %{public}s (%{public}s) AudioServerPlugIn Initialized", SL3_VERSION, SL3_DEBUG ? "DEBUG" : "release");
     return kAudioHardwareNoError;
 }
