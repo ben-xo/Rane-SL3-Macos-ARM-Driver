@@ -789,7 +789,7 @@ struct PanelView: View {
                         .font(.callout)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
                 }
             }
