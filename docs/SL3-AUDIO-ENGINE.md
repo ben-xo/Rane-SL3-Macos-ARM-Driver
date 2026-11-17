@@ -569,7 +569,9 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
   path).
 - **Control bytes 4–7 of each deck's block** are passed to the DSP with unknown meaning (two 0–127 values at
   96, two flags at 0). One of them may be a level.
-- **The overload flags**: which six signals they are.
+- **The overload flags**: probably the six inputs in channel order. Seen: flag 3 set by the Left deck's
+  left input (a loopback cable on that deck with the deck on thru is an analog feedback loop: the flag set
+  and the box's overload light came on; switching the deck to USB broke the loop and cleared it).
 - **The firmware tools** (`tools/firmware/`) have not been run on an SL 3.
 - **Serato DJ Pro 4.x / 5.x**: works (tested by hand on an SL 3
   with firmware 2.31, 2026-11-17; Serato uses the driver directly, not Sl3Api).

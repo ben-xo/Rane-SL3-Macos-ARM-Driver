@@ -25,6 +25,10 @@ adapting for another driver.
    clicks and a loud tone into it.
 3. Set the Left deck's LINE/PHONO switch to **LINE**. A line-level signal into the phono preamp clips,
    and the glitch test then reports a glitch at its first analysed sample.
+
+   Unplug the cable when the tests are done. With nothing streaming the deck is on analogue thru, which
+   connects its input to its output inside the box: with the cable in, that is a feedback loop, and the
+   box's overload light comes on (overload flag 3, the Left deck's left input).
 4. Install the driver build under test: `make install` (add `DEBUG=1` for the driver's counters and
    `sl3dbg`), which builds it and runs `sudo tools/install-sl3.sh`. The script replaces the binary inside
    the installed driver, so the release package (`Installer/RaneSL3-macOS-Universal.pkg`) must be
