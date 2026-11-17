@@ -608,6 +608,14 @@ setting or early read (44), and the heartbeat below.
       doesn't, as firmware 2.50 reports thru changes and could report its own DSP boot's.)
     - Test: `sl3panel usb`, sleep and wake the Mac: every deck stays on USB, nothing logged; `make hwtest`'s
       sleep step (decks on thru) still passes.
+28. **Any failure to open the HID interface reset the box's configuration.**
+    - Cause: the open's error was dropped, so every failure on an interface that was there was taken for
+      another driver holding it (entry 16), and the box's configuration was set again. Found on the SL 2
+      (SL 2 commit `843eb13`).
+    - Fix: when the open fails, the interface's `UsbExclusiveOwner` property is read (it named
+      "AppleUserUSBHostHIDDevice" when macOS's HID driver held it); the configuration is reset only if someone
+      holds it, logging the holder and the error; any other failure is logged.
+    - Test: `make hwtest` (normal opens); the held case as in entry 16 logs the holder's name.
 
 ## Testing
 
