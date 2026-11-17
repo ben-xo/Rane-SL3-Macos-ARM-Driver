@@ -546,6 +546,13 @@ setting or early read (44), and the heartbeat below.
       cleared and the next read waits 10 ms; a retry goes ahead only on the pipe it was for. Each error is
       logged once, not per retry.
     - Test: `make hwtest` (the HID path throughout); the error paths have no fault hook yet.
+20. **With a box with no firmware attached, every Sl3Api call waited 2 s.**
+    - Cause: Sl3Api waits up to 2 s for the driver to open a box that is in the USB registry, and stopped
+      early only when there was no box or no driver. The driver never opens a box with no firmware (it lists
+      it in boot mode), so each command from Serato or Rane's control panel blocked 2 s before failing.
+      Found in a code review.
+    - Fix: the wait also ends when the driver's status says boot mode.
+    - Test: needs a box with no firmware (after an interrupted `sl3flash`): Sl3Api calls fail at once.
 
 ## Testing
 
