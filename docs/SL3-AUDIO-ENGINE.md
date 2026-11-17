@@ -535,8 +535,11 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
   readings can flicker for ~0.2 s while a switch moves), unplug and replug idle and mid-stream (every deck
   back on thru, volume and mute kept, coreaudiod unaffected), every deck switched to USB and back through
   Sl3Api.
-- **Still to confirm on the hardware:** the settle check after a real Mac sleep (USB suspend; the Mac
-  tested couldn't sleep, held awake by Internet Sharing) and after a slow DSP boot; the other channels
+- **The settle check after a Mac sleep**, confirmed: the USB suspend turned the box's yellow light off, and
+  after the wake the driver logged "a deck was on USB audio with nothing streaming: back to thru" and "the
+  box was at 44100 Hz: set to 48000 Hz", as the 2.31 firmware's DSP boot predicts. `make hwtest` has a
+  step for it (skipped while something holds a PreventSystemSleep assertion, as Internet Sharing does).
+- **Still to confirm on the hardware:** the settle check after a slow DSP boot at connect; the other channels
   (Aux, Right deck) carrying audio; how a box with no firmware enumerates; firmware 2.50 (the box tested
   runs 2.31); the firmware tools; Serato DJ Pro 2.5.5 with turntables; Serato 4.x / 5.x.
 - **Control bytes 4–7 of each deck's block** are passed to the DSP with unknown meaning (two 0–127 values at

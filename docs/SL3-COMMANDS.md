@@ -373,7 +373,8 @@ traffic stopping). It differs in:
   (observed: no report after `0x33` to bytes 8/14/20, with reports enabled).
 - **The DSP boot sets the routing and the rate.** When the DSP has booted (after a high-speed configuration,
   and after every resume from USB suspend), bytes 8/14/20 are forced to 1 (USB) and the rate to 44100. A host
-  must set thru and the rate again afterwards (the driver's settle check does).
+  must set thru and the rate again afterwards (the driver's settle check does). Observed after a Mac sleep:
+  every deck on USB and the rate at 44100 on wake.
 - Byte 21 is computed from PD4 when `0x32` is read rather than stored; there is no DSP "D1" command; bytes
   14/20 are also cleared on suspend with external power.
 - The DSP program's first stage (`0x2800–0x2E01`) is the same as 2.50's; the second stage is a different build.
