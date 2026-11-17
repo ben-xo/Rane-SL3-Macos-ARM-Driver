@@ -2093,8 +2093,11 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         g_io_clients = 0;
         pthread_mutex_unlock(&g_mutex);
     }
-    /* Bootloader mode follows what is still attached; tell the HAL if the device left its list. */
-    atomic_store(&g_boot_mode, bootloader);
+    /* Boot mode follows what is still attached (a box with no firmware, or Rane's loader, known by
+       its version); tell the HAL if the device left its list. */
+    bool loader = atomic_load(&g_box_present) &&
+                  (g_st.version_maj << 8 | g_st.version_min) == SL3_BOOTSTRAP_VERSION;
+    atomic_store(&g_boot_mode, bootloader || loader);
     if (was_published != device_published()) notify_device_list_changed();
 }
 
