@@ -2,12 +2,16 @@
 /*
  * sl3flash — write the Rane SL 3's firmware into its boot EEPROM over USB.
  *
- *   sl3flash [--firmware DIR] [--force] [--dry-run] [--wait SECONDS] [--blank-fx2]
+ *   sl3flash [--firmware DIR] [--force] [--dry-run] [--backup-only] [--wait SECONDS] [--blank-fx2]
  *     --firmware DIR  directory holding the firmware images (*.bin, recognised by content);
  *                     default: /Library/Audio/Plug-Ins/HAL/SL3Device.firmware
- *     --force         rewrite the EEPROM even if it already holds the image
+ *     --force         rewrite the EEPROM even if it already holds the image, or holds newer
+ *                     firmware than the image
  *     --dry-run       check the images and the box (and compare its EEPROM with the image)
  *                     without changing anything
+ *     --backup-only   save the EEPROM to sl3-eeprom-backup-<date>.bin and change nothing (a box with
+ *                     no firmware first has the bootstrap loaded into its RAM to read it, and runs it
+ *                     until it is power-cycled); needs no final image
  *     --wait SECONDS  wait up to this long for a box to be connected
  *     --blank-fx2     also take a Cypress FX2 with a blank EEPROM (04b4:8613) as the SL 3: any
  *                     other device built on a blank FX2 (a logic analyser, say) shows up the same
@@ -42,7 +46,8 @@
  * whole EEPROM (16 KiB) is saved to sl3-eeprom-backup-<date>.bin in the current directory.
  *
  * The EEPROM is read first. If it already holds the image, a running box is left alone and a box
- * running the bootstrap is only marked bootable again (0x16), unless --force is given. Otherwise
+ * running the bootstrap is only marked bootable again (0x16), unless --force is given. A box
+ * running newer firmware than the image is left alone too, unless --force is given. Otherwise
  * every block is written and checked against its read-back, and then the whole image range is read
  * again and compared with the image before 0x16 makes it bootable. If anything fails before 0x16,
  * byte 0 stays 0xC0: a running box keeps working until it is power-cycled, then comes up with no
@@ -353,7 +358,7 @@ static bool finalize(AudioObjectID hal, const uint8_t *final_hdr) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     const char *dir = kDefaultDir;
-    bool dry = false, force = false, blank_ok = false;
+    bool dry = false, force = false, blank_ok = false, backup_only = false;
     int waitsecs = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dry-run")) dry = true;
@@ -361,11 +366,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--firmware") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--wait") && i + 1 < argc) waitsecs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--blank-fx2")) blank_ok = true;
-        else { fprintf(stderr, "usage: %s [--firmware DIR] [--force] [--dry-run] [--wait SECONDS] [--blank-fx2]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--backup-only")) backup_only = true;
+        else { fprintf(stderr, "usage: %s [--firmware DIR] [--force] [--dry-run] [--backup-only] [--wait SECONDS] [--blank-fx2]\n", argv[0]); return 2; }
     }
 
+    /* The images (a backup needs none, unless the bootstrap has to be loaded to read the EEPROM). */
     image_t final = {0}, boot = {0};
-    if (!load_images(dir, &final, &boot)) return 1;
+    if (!load_images(dir, &final, &boot) && !backup_only) return 1;
     const uint8_t *hdr = final.data.bytes, *pay = hdr + RANE_HDR;
 
     /* Find the box: one with no firmware shows up on USB only; a running box answers 0x01 through
@@ -404,7 +411,7 @@ int main(int argc, char **argv) {
     } else {
         printf("SL 3 with no firmware running (%04x:%04x, no strings)\n", b[0].vid, b[0].vid == SL3_VID ? SL3_PID : FX2_DEFAULT_PID);
         if (!boot.data) { printf("no bootstrap image in %s; it is needed for a box in this state\n", dir); release_boxes(b, n); return 1; }
-        if (dry) { printf("dry run: would load the bootstrap, then program the EEPROM\n"); release_boxes(b, n); return EXIT_WOULD_WRITE; }
+        if (dry && !backup_only) { printf("dry run: would load the bootstrap, then program the EEPROM\n"); release_boxes(b, n); return EXIT_WOULD_WRITE; }
         bool ok = stage1(b[0].svc, boot.data);
         release_boxes(b, n);
         if (!ok) return 1;
@@ -416,12 +423,28 @@ int main(int argc, char **argv) {
     /* Read the whole EEPROM: the image range decides what to do; all of it is the backup. */
     uint8_t *cur = malloc(SL3_EEPROM_SIZE);
     if (!read_eeprom(hal, cur, SL3_EEPROM_SIZE, "reading the EEPROM")) { free(cur); return 1; }
+    if (backup_only) {
+        bool saved = save_backup(cur);
+        free(cur);
+        if (saved && !running) printf("the box runs the bootstrap until it is power-cycled; its EEPROM is unchanged\n");
+        return saved ? 0 : 1;
+    }
     bool same = memcmp(cur + 1, pay + 1, IMAGE_LEN - 1) == 0;
     uint8_t boot_hdr = cur[0];
     printf("EEPROM %s the image; boot byte 0x%02x (%s)\n", same ? "matches" : "differs from", boot_hdr,
            boot_hdr == HDR_BOOT ? "bootable" : boot_hdr == HDR_NOBOOT ? "not bootable" : "invalid");
 
-    if (same && !force && running && boot_hdr == HDR_BOOT && (maj << 8 | min) != BOOTSTRAP_VERSION) {
+    /* Not over newer firmware: a running box (not the bootstrap, whose version is the loader's) on a
+       later version than the image is left alone. */
+    bool bootstrap = (maj << 8 | min) == BOOTSTRAP_VERSION;
+    if (running && !bootstrap && !same && !force && (hdr[0x27] << 8 | hdr[0x28]) < (maj << 8 | min)) {
+        printf("the box runs firmware %u.%02u, newer than the image's %u.%02u: not writing it (--force writes it anyway)\n",
+               maj, min, hdr[0x27], hdr[0x28]);
+        free(cur);
+        return 0;
+    }
+
+    if (same && !force && running && boot_hdr == HDR_BOOT && !bootstrap) {
         printf("nothing to do (--force rewrites it anyway)\n");
         free(cur);
         return 0;
