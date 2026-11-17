@@ -440,6 +440,9 @@ else
         record SKIP "fault hook: errored capture packets" "release build (make install DEBUG=1)"
     fi
     [ $have_volume = 1 ] && restore_volume
+    # With nothing streaming the decks are on analogue thru, which connects each deck's input to its output
+    # inside the box: with the loopback cable still in, that is a feedback loop (the overload light comes on).
+    echo "   >>> Unplug the loopback cable now: with the deck on thru it makes a feedback loop (the overload light comes on)."
 fi
 echo
 
@@ -575,8 +578,5 @@ for r in "${RESULTS[@]}"; do
     case $s in PASS) pass=$((pass + 1)) ;; FAIL) fail=$((fail + 1)) ;; SKIP) skip=$((skip + 1)) ;; esac
 done
 echo "$pass passed, $fail failed, $skip skipped. Log: $LOG"
-# The decks end on analogue thru, which connects each deck's input to its output inside the box: with the
-# loopback cable still in, that is a feedback loop, and the box's overload light comes on.
-[ $LOOPBACK = 1 ] && echo "Unplug the loopback cable now: with the deck on thru it makes a feedback loop (the overload light comes on)."
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $([ $fail = 0 ] && echo 0 || echo 1)
