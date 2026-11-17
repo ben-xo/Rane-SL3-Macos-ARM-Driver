@@ -686,8 +686,13 @@ static void send_hw_samplerate(int sr) {
 /* Switch every deck to USB audio or analogue thru: control bytes 8, 14 and 20 (Aux, Left, Right),
    one 0x33 each, so the bytes between them are left alone. The box confirms each change with a 0x39
    report, which reaches clients. */
+/* Each deck's output source as the driver last set it or a client set it through the driver
+   (1 = USB), under g_mutex: what the settle check puts back. Not taken from the box's reports, so a
+   change the box makes by itself (its DSP booting) is still told from one a client chose. */
+static uint8_t g_routing_known[SL3_NDECKS];
 static void set_sources(const uint8_t source[SL3_NDECKS]) {
     for (int d = 0; d < SL3_NDECKS; d++) {
+        g_routing_known[d] = source[d] ? 1 : 0;
         uint8_t pl[3] = { (uint8_t)SL3_CTL_SOURCE_AT(d), 1, source[d] ? 1 : 0 };
         hid_cmd(SL3_CMD_SET_CONTROLS, pl, 3, NULL, NULL);
         ST_LOCK(); g_st.thru[d] = source[d] ? 0 : 1; ST_UNLOCK();
@@ -2158,24 +2163,29 @@ static void relist_if_safety_changed(void) {
    so at power-up) and sets the rate back to 44.1 kHz. The DSP boots after the box is configured, and
    again after a USB suspend and resume (the Mac sleeping), so it can finish after connect_box has set
    thru and the rate. A while after connecting, and after the Mac wakes, the driver checks: with nothing
-   streaming, every deck back on thru; and the rate the driver's. */
+   streaming, that each deck's output source is still the one the driver last knew (g_routing_known: what
+   it set, thru or the routing kept across a replug, or what a client set through it, so a deck put on
+   USB on purpose stays there); and that the box's rate is the driver's. Each correction is logged. */
 #define SETTLE_CHECK_MS 2000
 static void settle_check(const char *why) {
     if (!atomic_load(&g_box_present)) return;   /* unplugged meanwhile */
     pthread_mutex_lock(&g_mutex);
     if (usb_ensure_hid() && !atomic_load(&g_boot_mode)) {
         uint8_t r[HID_REPORT_LEN];
-        /* The routing: only with nothing streaming (a stream has the decks as its client sets them):
-           thru, or as before a replug while the client is expected back (see g_resume_pending). */
+        /* The routing: only with nothing streaming (a stream has the decks as its client sets them).
+           Put back a routing the box has lost, as the driver last knew it. */
         if (!atomic_load(&g_io_running) && hid_cmd(SL3_CMD_GET_CONTROLS, NULL, 0, r, NULL)) {
             note_controls(r + 5);
-            bool wrong = false;
-            for (int d = 0; d < SL3_NDECKS; d++)
-                if ((r[5 + SL3_CTL_SOURCE_AT(d)] != 0) != (g_resume_pending && g_resume_source[d])) wrong = true;
-            if (wrong) {
-                LOG("%{public}s: the decks' routing had changed with nothing streaming: %{public}s", why,
-                    g_resume_pending ? "routed as before the replug" : "back to thru");
-                set_idle_routing();
+            uint8_t known[SL3_NDECKS];
+            bool lost = false;
+            for (int d = 0; d < SL3_NDECKS; d++) {
+                known[d] = g_routing_known[d];
+                if ((r[5 + SL3_CTL_SOURCE_AT(d)] != 0) != (known[d] != 0)) lost = true;
+            }
+            if (lost) {
+                LOG("%{public}s: the box had lost the decks' routing: put back (Aux %{public}s, Left %{public}s, Right %{public}s)",
+                    why, known[0] ? "USB" : "thru", known[1] ? "USB" : "thru", known[2] ? "USB" : "thru");
+                set_sources(known);
             }
         }
         /* The rate, streaming or not. */
@@ -3325,6 +3335,7 @@ static OSStatus SL3_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                         int idx = SL3_CTL_SOURCE_AT(d), at = idx - req[5];
                         if (at >= 0 && at < req[6] && idx < SL3_CONTROLS_LEN - 1 && req[7 + at] <= 1) {
                             ST_LOCK(); g_st.thru[d] = req[7 + at] ? 0 : 1; ST_UNLOCK();
+                            g_routing_known[d] = req[7 + at];   /* the client's choice: the settle check keeps it */
                         }
                     }
                 }

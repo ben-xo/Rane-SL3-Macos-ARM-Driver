@@ -599,6 +599,15 @@ setting or early read (44), and the heartbeat below.
       routing and waits again.
     - Test: stream, unplug, replug, unplug again within 5 s, replug: "Decks routed as before the unplug"
       after each replug, one "No stream restarted" 5 s after the last.
+27. **The settle check undid a routing a client chose.**
+    - Cause: it compared each deck's source with thru (or the routing kept across a replug), so a deck put on
+      USB on purpose with nothing streaming (sl3panel, the control panel, Rane's panel) went back to thru
+      2 s after a connect or after the next Mac sleep. Found on an SL 2 (SL 2 commit `88aa514`).
+    - Fix: the driver keeps the routing it last set or a client set through it (`g_routing_known`) and puts
+      back only a deck that differs from it, as it was. (The SL 2 takes the box's reports as known; the SL 3
+      doesn't, as firmware 2.50 reports thru changes and could report its own DSP boot's.)
+    - Test: `sl3panel usb`, sleep and wake the Mac: every deck stays on USB, nothing logged; `make hwtest`'s
+      sleep step (decks on thru) still passes.
 
 ## Testing
 
