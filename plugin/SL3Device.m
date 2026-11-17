@@ -330,6 +330,10 @@ static UInt32 in_safety_frames(void) {
    DP_OUT_LATENCY_MS after its timeline position, and the HAL writes DP_OUT_SAFETY_MS ahead. */
 #define DP_OUT_SAFETY_MS  2.0
 #define DP_OUT_LATENCY_MS 1.5
+/* The rest of the round trip is the box's (its FIFOs and converters): measured through a loopback
+   cable on an SL 3 (firmware 2.31) as 73-74 frames at both rates, beyond the output latency. The
+   output stream's 32 frames and this make 76, slightly over, as reported latency should be. */
+#define IN_DEVICE_LATENCY_FRAMES 44
 static UInt32 out_safety_frames(void) {
     return (UInt32)(DP_OUT_SAFETY_MS * g_sr / 1000.0 + 0.5);
 }
@@ -2784,7 +2788,7 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
             case kAudioDevicePropertyDeviceCanBeDefaultDevice:
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyLatency:
-                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeOutput) ? out_latency_frames() : 32;
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeOutput) ? out_latency_frames() : IN_DEVICE_LATENCY_FRAMES;
                 *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertySafetyOffset:
                 *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? in_safety_frames() : out_safety_frames();
@@ -2958,9 +2962,9 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
             case kAudioStreamPropertyStartingChannel: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
             case kAudioStreamPropertyLatency:
                 /* Clients add device and stream latency. With 32 frames on the output stream and
-                   none on the input, the device's total (66 + 32 out, 32 in = 130 frames, 2.95 ms
-                   at 44.1 kHz) matches the round trip measured through a loopback cable (rtlat:
-                   2.8 ms), slightly over rather than under. */
+                   none on the input, the device's total (output latency + 32 out, 44 in: 142 frames
+                   at 44.1 kHz, 148 at 48 kHz) matches the round trip measured through a loopback
+                   cable (rtlat: 138-139 and 143-146 frames), slightly over rather than under. */
                 *(UInt32*)outData = (oid == kObjStreamOut) ? 32 : 0;
                 *outSize = sizeof(UInt32); return 0;
             case kAudioStreamPropertyVirtualFormat:
