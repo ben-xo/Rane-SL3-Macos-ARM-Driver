@@ -574,6 +574,14 @@ setting or early read (44), and the heartbeat below.
     - Fix: the match, copy and signal, and `hid_cmd`'s setting up and giving up of its wait, are made under
       one lock (`g_reply_mtx`); a reply handed over as the wait runs out is taken rather than dropped.
     - Test: `make hwtest` (every command); the window is too narrow to hit on purpose.
+24. **A StopIO left over from before an unplug could stop the stream started after the replug.**
+    - Cause: the driver counted clients, not which ones; the unplug resets the count, so a StopIO for a
+      pre-unplug session arriving after a replug and a new client's StartIO took the count back to zero and
+      stopped the new stream (decks to thru). In testing the HAL sent its StopIO at the unplug, so this needs
+      one delayed by seconds. Found in a code review.
+    - Fix: clients are kept by ID (`g_io_cids`), cleared at an unplug; a StopIO from a client not counted is
+      logged and ignored.
+    - Test: `make hwtest`, "unplug and replug, mid-stream"; and Serato streaming across a replug.
 
 ## Testing
 
