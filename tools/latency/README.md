@@ -74,7 +74,15 @@ go stale when it restarts; `restart-audio.sh` does the restart alone.
 
 ## Expected results
 
-Not yet measured on the SL 3. For comparison, the SL 2 driver (the same engine) at 44.1 kHz:
+On an SL 3 (firmware 2.31), 128-frame buffer:
+
+- `restartcheck.sh`: three streams, each "DVS round trip est. 11.8 ms (4/4 clicks)" at 48 kHz (12.4 ms at
+  44.1 kHz), then PASS.
+- `rtlat "SL 3" 3 3 20 48` (Serato's 48 frames at 48 kHz): "DVS round trip est. 8.5 ms".
+- `dptest.sh 30` (debug build): "0 glitches" idle and loaded, then PASS.
+- `DBG capture packet sizes`: 5 and 6 frames at 44.1 kHz; at 48 kHz 6, with about 0.5% of 5s and 7s.
+
+The SL 2 driver (the same engine) at 44.1 kHz, for comparison:
 
 - `restartcheck.sh`: three streams, each "DVS round trip est. 12.2 ms (4/4 clicks)" at a 128-frame
   buffer, then PASS.
@@ -88,5 +96,3 @@ Not yet measured on the SL 3. For comparison, the SL 2 driver (the same engine) 
   the driver logs "Capture: N ms not captured", and the stream carries on. `sl3dbg stall 20`: no gap (the
   early capture read covers it). `sl3dbg errpkts 20`: a gap of about 3 ms, sent − captured within ±2.
 
-The SL 3's results go here once measured, at both rates (the driver defaults to 48 kHz) and at the IO
-buffer sizes Serato uses (48 frames, its SL 3 alignment, at 48 kHz).

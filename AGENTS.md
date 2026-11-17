@@ -56,7 +56,10 @@ still to be confirmed on the hardware.
 - Isochronous endpoints `0x06` OUT and `0x82` IN, 126-byte packets: 7 frames × 6 channels × 3 bytes. The
   samples are packed 24-bit, with no pad byte (c.f. the SL 2's 4-byte samples). (Descriptors.)
 - Channels 1-2 Aux, 3-4 Left deck, 5-6 Right deck; the control bytes and reports come in the same order.
-  (Rane's labels; to confirm with signals.)
+  (Rane's labels; channel 3 = Left Deck L confirmed with a loopback cable.)
+- Boxes in the field run different firmware: one tested runs 2.31, Rane's last driver carries 2.50, and they
+  differ (2.31 has no `0x39` report; its DSP boot puts the decks on USB and the rate at 44.1 kHz).
+  `docs/SL3-COMMANDS.md` says which is which.
 - One LINE/PHONO switch per deck (the SL 2 has one for the box), physical, reported in control bytes 0-2
   and report `0x38`; software can only read them. (Firmware.)
 - Each deck's thru is its output-source control byte, 8, 14 or 20 (1 = USB audio, 0 = thru), written with
@@ -64,8 +67,8 @@ still to be confirmed on the hardware.
 - The firmware version comes from HID `0x01` (`02 32` = 2.50); `bcdDevice` is 0x0000 whether the firmware
   runs or not, so a box with no firmware is told by its missing strings. The serial string is the same on
   every box. (Firmware; the no-firmware case is inferred.)
-- The box doesn't check the `0x37` heartbeat. (Firmware and Rane's kext; to confirm on the hardware, as
-  `make hwtest` does.)
+- The box doesn't check the `0x37` heartbeat. (Firmware 2.31 and 2.50, Rane's kext; confirmed on a 2.31
+  box: 30 s of USB audio with none.)
 - The box powers up at 44.1 kHz with the control bytes at their defaults; only the phono sensitivities are
   kept. (Firmware; contradicts earlier probing notes.)
 - Rane's own `Sl3Api.framework` and control panel are the reference for what clients expect: match their

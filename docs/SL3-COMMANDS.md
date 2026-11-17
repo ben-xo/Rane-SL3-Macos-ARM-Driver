@@ -359,6 +359,28 @@ about hardware or on the separate kext analysis; **low** = inference.
    wake; nothing at stream start/stop/close/sleep; no periodic traffic (no `0x37`); never touches the
    thru/USB bytes (medium; from the kext analysis).
 
+### Firmware 2.31
+
+A box tested by this project runs firmware 2.31 (`0x01` answers `02 1F`, build stamp `4D 12 8A 13`),
+dumped from its EEPROM with `sl3dump` and disassembled the same way. It is the same as 2.50 in: the opcode
+set and dispatch; the EEPROM gating of `0x02`/`0x17`; `0x31`'s two rates and the UAC 1.0 endpoint rate
+request; the control bytes' maxima and defaults; which bytes are saved (3/9/15 at `0x3FC0–2`); the alt-1
+streaming setup; `0x36` cleared at every enumeration; the `0x37` routine; **no watchdog** (the timer
+interrupts are unused, the SOF interrupt only schedules the overload poll, and nothing reacts to `0x37`
+traffic stopping). It differs in:
+
+- **No `0x39` report.** Only `0x34` and `0x38` exist, so a change of output source is not confirmed
+  (observed: no report after `0x33` to bytes 8/14/20, with reports enabled).
+- **The DSP boot sets the routing and the rate.** When the DSP has booted (after a high-speed configuration,
+  and after every resume from USB suspend), bytes 8/14/20 are forced to 1 (USB) and the rate to 44100. A host
+  must set thru and the rate again afterwards (the driver's settle check does).
+- Byte 21 is computed from PD4 when `0x32` is read rather than stored; there is no DSP "D1" command; bytes
+  14/20 are also cleared on suspend with external power.
+- The DSP program's first stage (`0x2800–0x2E01`) is the same as 2.50's; the second stage is a different build.
+
+Measured on that box: the rate is 48000 after the driver sets it and stays there through re-enumeration;
+control bytes 4/6 of each block read `0x60`, 5/7 read 0; the phono sensitivity byte can be set and is saved.
+
 ### Corrections to earlier notes on this box
 
 The OpenSL3 project's protocol notes (this repository's `docs/PROTOCOL.md` until this document

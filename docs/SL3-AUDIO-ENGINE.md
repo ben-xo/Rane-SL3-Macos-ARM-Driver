@@ -20,9 +20,28 @@ stand, and this document gives the SL 3's differences and its own catalogue. The
 
 ## Results
 
-**Not yet measured on the SL 3.** `make hwtest ARGS="--loopback"` measures the round trip at both rates and
-at IO buffers from 32 to 512 frames; the results go here. For comparison, the same engine on the SL 2
-(loopback Left Deck Out L to In L, line level, 44.1 kHz unless noted):
+Measured on an SL 3 running firmware 2.31, through one USB hub, with a loopback cable from Left Deck Out L
+to Left Deck In L (channel 3, line level), debug build, `make hwtest ARGS="--loopback"` (2026-11-17):
+
+| SL 3 | IO buffer | Unreported latency | Est. DVS round trip | Glitches |
+|---|---|---|---|---|
+| 48 kHz | 32 / 45 / **48** / 64 frames | 3.0 ms | 7.8 / 8.4 / **8.5** / 9.1 ms | — |
+| 48 kHz | 128 / 256 / 512 frames | 3.0 ms | 11.8 / 17.2 / 27.8 ms | none in 30 s idle and 30 s with every core busy (`dptest.sh`) |
+| 44.1 kHz | 32 / 45 / 48 / 64 frames | 3.1 ms | 8.1 / 8.7 / 8.8 / 9.5 ms | — |
+| 44.1 kHz | 128 / 256 / 512 frames | 3.1 ms | 12.4 / 18.3 / 29.9 ms | none in a 10 s check |
+
+48 frames at 48 kHz is Serato's IO buffer for the SL 3, so Serato DJ Pro gets an **8.5 ms** DVS round trip.
+The early read's least margin was 1.17 ms at the 1.5 ms input safety offset, through a 20 ms completion
+stall. Glitches were seen in two 30 s runs out of about twenty (18 and 101, residuals 0.01–0.19 against a
+0.4 tone) while other work ran on the Mac, with every driver counter clean (no late writes, nothing
+unscheduled, sent − captured within 2, no early-read differences); they couldn't be reproduced with
+every core busy, during a full rebuild, or after click tests, and a later 8-minute hwtest run was clean.
+Their cause is open; nothing the driver measures moved.
+
+The box runs with no `0x37` heartbeat: 30 s glitch tests at full level, decks on USB audio throughout.
+
+For comparison, the same engine on the SL 2 (loopback Left Deck Out L to In L, line level, 44.1 kHz unless
+noted):
 
 - **Unreported latency** is the delay beyond what the HAL's timestamps account for, found by playing clicks
   and locating them in the captured input (`tools/latency/rtlat.c`).
@@ -37,9 +56,8 @@ at IO buffers from 32 to 512 frames; the results go here. For comparison, the sa
 | Deep schedule + early capture read, 48 kHz, release build | 64 / 128 frames | 2.8 ms | **8.9 / 11.6 ms** | none in a 30 s check, idle |
 | Deep schedule + early capture read, release build: Serato's 1 ms | **45 frames** | 2.8 ms | **8.3 ms** | none in 60 s idle and 150 s with six x264 encodes |
 
-The SL 3's own figures will differ by what the box itself adds (its converters and its DSP: the SL 3's audio
-goes through a DSP56300-family DSP, the SL 2's through an FPGA), and the latency the driver reports is to be
-set from a measurement.
+The two boxes come out within a few tenths of a millisecond of each other: the SL 3's own part of the round
+trip (its FIFOs, DSP and converters) is 73–74 frames at either rate.
 
 **Serato's "USB buffer size" is the CoreAudio IO buffer size.** Serato DJ Pro (2.5.5, from its code) turns
 the setting into frames, rounded to the device's alignment (Serato's description of the SL 3 gives 48 frames,
@@ -139,7 +157,8 @@ here, which counts twice in the round trip; the input safety offset (counted onc
     starts again from the completion's.
   - A buffer is tagged with its USB frame while queued and 0 while it is refilled. The early reader checks
     the tag before and after each packet, so a refilled buffer never reaches the ring.
-- **The input safety offset is 1.5 ms by default: the SL 2's measured figure, not yet measured on the SL 3.**
+- **The input safety offset is 1.5 ms by default.** Measured on the SL 3 (firmware 2.31): the least margin was
+  1.17 ms idle and 0.75 ms over long runs, through a 20 ms completion stall with no gap. The SL 2's figures:
   - On the SL 2, with the early read, the least margin (how far ahead of the read the captured frames
     reached) was the offset less about 0.35 ms idle, and less 0.75–0.9 ms under load. At 1 ms the margin
     under load fell to 0.23 ms; at 1.5 ms it stayed 0.6–0.73 ms (5 min idle, 5 min all cores busy, six
@@ -243,16 +262,16 @@ here, which counts twice in the round trip; the input safety offset (counted onc
 |---|---|
 | Output device latency | 1.5 ms |
 | Output safety offset | 2 ms |
-| Input device latency | 32 frames |
+| Input device latency | 44 frames (measured on the SL 3) |
 | Input safety offset | 1.5 ms (the default setting; 8 ms recommended where the early read doesn't work) |
 | Output stream latency | 32 frames |
 | Input stream latency | 0 |
 | Zero-timestamp period | 16384 frames |
 
-These are the SL 2's, where the reported total (2.95 ms at 44.1 kHz) was set to the measured 2.8–2.9 ms. The
-output latency and safety offsets come from the design (the 1 ms transfers and write guard), so they hold for
-the SL 3; the device and stream latencies include what the box adds and **must be set from `rtlat` on the
-SL 3**.
+The output latency and safety offsets come from the design (the 1 ms transfers and write guard). The input
+device latency is the SL 3's own, from `rtlat`: the box adds 73–74 frames beyond the output latency, so with
+the output stream's 32 frames the input device reports 44. The total, 142 frames at 44.1 kHz and 148 at
+48 kHz, is a few frames over the measured 138–139 and 143–146, on the safe side.
 
 ### 4a. Output volume (`vol_*`)
 
@@ -507,12 +526,14 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
 
 ## Still open
 
-- **Everything measured on the SL 2 needs measuring on the SL 3**: the round trip and the latency to report
-  (§4), the input safety offset's margin, the IO buffer sizes Serato uses (48 frames at 48 kHz), whether the
-  box accepts predicted OUT packet sizes, glitches under load.
-- **Firmware facts to confirm on the hardware:** no heartbeat needed; the rate and control bytes reset at
-  power-up; the box's packet sizes (5/6 frames at 44.1 kHz, 6 at 48 kHz); the channel order (Rane's labels:
-  1–2 Aux, 3–4 Left, 5–6 Right); how a box with no firmware enumerates.
+- **Measured on an SL 3 (firmware 2.31)**: the round trip at every IO buffer from 32 to 512 frames at both
+  rates, the latency to report, the early read's margin, that the box takes predicted OUT packet sizes
+  (sent − captured within 2), no heartbeat needed, the packet sizes (5/6 frames at 44.1 kHz; 6 at 48 kHz with
+  about 0.5% of 5s and 7s as the box corrects its clock), channel 3 = Left Deck L.
+- **Two glitchy runs** (see Results), cause unknown, not reproduced.
+- **Still to confirm on the hardware:** the rate and control bytes after a power cycle and after a Mac
+  sleep (the settle check); each deck's LINE/PHONO report (`0x38`); unplug and replug; the other channels
+  (Aux, Right deck); how a box with no firmware enumerates; firmware 2.50 (the box tested runs 2.31).
 - **Control bytes 4–7 of each deck's block** are passed to the DSP with unknown meaning (two 0–127 values at
   96, two flags at 0). One of them may be a level.
 - **The overload flags**: which six signals they are.
