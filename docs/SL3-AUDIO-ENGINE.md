@@ -553,6 +553,12 @@ setting or early read (44), and the heartbeat below.
       Found in a code review.
     - Fix: the wait also ends when the driver's status says boot mode.
     - Test: needs a box with no firmware (after an interrupted `sl3flash`): Sl3Api calls fail at once.
+21. **A rate change while streaming sent the rate to the box twice.**
+    - Cause: `if (was_streaming && !usb_open_all()) … else …` ran the else branch (meant for no stream
+      running) whenever the restart succeeded, so the rate (`0x31`) went to the box again and clients got a
+      second sample-rate event. Found in a code review.
+    - Fix: the restart and the no-stream case are separate branches.
+    - Test: `make hwtest`, "the other sample rate" (one "Sample rate changed" per change).
 
 ## Testing
 
