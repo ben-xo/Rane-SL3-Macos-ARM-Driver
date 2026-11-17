@@ -35,8 +35,16 @@ tools/latency/bin/%: tools/latency/%.c tools/latency/common.h
 	@mkdir -p tools/latency/bin
 	$(CC) -O2 -framework CoreAudio -framework CoreFoundation -framework AudioToolbox $< -o $@
 
+# the hardware tests in one run (tools/hwtest.sh), on the installed driver with a box attached
+# (install a debug build first, make install DEBUG=1, to also run the debug-only tests):
+#   make hwtest ARGS="--loopback"   with the loopback cable in (Left Deck Out L to In L); add
+#                                   --no-physical to skip the steps that need someone at the box
+#                                   (each deck's LINE/PHONO switch, unplug and replug)
+hwtest: panel apitest latency
+	tools/hwtest.sh $(ARGS)
+
 clean:
 	rm -f SL3Device Sl3Api sl3panel sl3apitest
 	rm -rf tools/latency/bin
 
-.PHONY: all plugin install api panel apitest latency clean
+.PHONY: all plugin install api panel apitest latency hwtest clean
