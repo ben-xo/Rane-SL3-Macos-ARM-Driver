@@ -2,6 +2,9 @@
 /SL3Device
 /Sl3Api
 /sl3panel
+/sl3apitest
+/tools/latency/bin/
+/build/
 *.o
 *.dSYM/
 .DS_Store
