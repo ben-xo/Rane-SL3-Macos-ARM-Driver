@@ -330,7 +330,8 @@ else
 
     # The box's capture packet sizes (debug build), at each rate: how many frames each microframe's
     # packet carries. The playback packet sizes are steered to match them (implicit feedback), so they
-    # must be the ones expected: 5 and 6 at 44.1 kHz (5.5125 on average), 6 at 48 kHz.
+    # must be the ones expected: 5 and 6 at 44.1 kHz (5.5125 on average); 6 at 48 kHz, with the odd 5
+    # or 7 where the box corrects its clock (seen on an SL 3: about 0.5%), so up to 1% of those.
     if [ $BUILD = debug ]; then
         ok=1; detail=""
         for r in 44100 48000; do
@@ -339,8 +340,14 @@ else
             "$B/sinetest" "$DEV" $LOOP $LOOP 3 128 >/dev/null 2>&1
             h=$(driver_log_since "$start" 'DBG capture packet sizes' | head -1 | sed -E 's/.*\): *//')
             detail="$detail $((r / 1000))k:${h:-none};"
-            want=$([ $r = 44100 ] && echo '^5:[0-9]+ 6:[0-9]+$' || echo '^6:[0-9]+$')
-            echo "$h" | grep -qE "$want" || ok=0
+            if [ $r = 44100 ]; then
+                echo "$h" | grep -qE '^5:[0-9]+ 6:[0-9]+$' || ok=0
+            else
+                awk -v h="$h" 'BEGIN { n = split(h, kv, " "); six = 0; other = 0
+                    for (i = 1; i <= n; i++) { split(kv[i], p, ":")
+                        if (p[1] == 6) six += p[2]; else if (p[1] == 5 || p[1] == 7) other += p[2]; else exit 1 }
+                    exit !(six > 0 && other <= (six + other) / 100) }' || ok=0
+            fi
         done
         "$B/setrate" "$DEV" "$orig" >/dev/null
         [ $ok = 1 ] && record PASS "capture packet sizes" "$detail" || record FAIL "capture packet sizes" "$detail"
