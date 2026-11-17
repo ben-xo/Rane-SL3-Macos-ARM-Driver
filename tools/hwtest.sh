@@ -438,7 +438,8 @@ if [ $PHYSICAL = 0 ]; then
     done
 else
     # The LINE/PHONO switches, one per deck: the status must follow each both ways, and only that
-    # deck's. Each ends where it started.
+    # deck's once the switch has settled (the firmware reads the switches without debouncing, and on an
+    # SL 3 flipping one switch made its neighbour read PHONO for about 0.2 s). Each ends where it started.
     ok=1; detail=""
     for deck in "Aux" "Left Deck" "Right Deck"; do
         first=$(deck_input_is "$deck" PHONO && echo LINE || echo PHONO)
@@ -446,6 +447,7 @@ else
         before=$(status | grep -E '^  (Aux|Left Deck|Right Deck) *:' | grep -v "^  $deck *:" | cut -c1-24)
         echo "   >>> Flip the $deck's LINE/PHONO switch to $first."
         if wait_until "the $deck on $first" deck_input_is "$deck" $first; then
+            sleep 1   # the box doesn't debounce: a neighbouring deck can read PHONO for ~0.2 s mid-flip
             others=$(status | grep -E '^  (Aux|Left Deck|Right Deck) *:' | grep -v "^  $deck *:" | cut -c1-24)
             [ "$others" = "$before" ] || { ok=0; detail="$detail $deck moved another deck's;"; }
             echo "   >>> Flip it back to $second."
