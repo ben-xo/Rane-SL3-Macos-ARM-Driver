@@ -589,6 +589,16 @@ setting or early read (44), and the heartbeat below.
       a code review.
     - Fix: one definition, `plugin/SL3Status.h`, included by all four (the control panel imports it).
     - Test: everything builds; `sl3apitest`, `sl3panel status` and the control panel read the status.
+26. **A second unplug soon after a replug could leave the decks on thru at the next replug.**
+    - Cause: the fallback a replug schedules (thru if no stream restarts within 5 s) was matched by
+      `g_resume_window`, which moved on only at a mid-stream unplug. Unplugged again within those 5 s, the
+      box was away when the fallback fired: it cleared the remembered routing, and the next replug put every
+      deck on thru, which Serato adopts. Seen on an SL 2 (SL 2 commits `4e04600`, `c69b7db`).
+    - Fix: each replug that restores the routing takes a new window, and every unplug moves the window on,
+      so a waiting fallback does nothing; the next replug (within 30 s of the first unplug) restores the
+      routing and waits again.
+    - Test: stream, unplug, replug, unplug again within 5 s, replug: "Decks routed as before the unplug"
+      after each replug, one "No stream restarted" 5 s after the last.
 
 ## Testing
 

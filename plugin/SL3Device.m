@@ -711,7 +711,8 @@ static void set_usb_switches(bool usb_mode) {
 static uint64_t g_resume_since;                /* host time of the unplug */
 static bool     g_resume_pending;
 static uint8_t  g_resume_source[SL3_NDECKS];   /* each deck's output source at the unplug: 1 = USB */
-static uint32_t g_resume_window;               /* which window a fallback belongs to */
+static uint32_t g_resume_window;               /* the latest fallback scheduled: an older one, or one whose box has
+                                                  gone again, does nothing */
 /* The routing with nothing streaming: the remembered one while a client is expected back, else thru. */
 static void set_idle_routing(void) {
     if (g_resume_pending) set_sources(g_resume_source);
@@ -2204,12 +2205,15 @@ static void connect_box(int attempt) {
     bool ok = usb_ensure_hid();
     /* (Not on Rane's firmware loader: it has no audio, and the firmware tools are using it.) */
     bool resuming = false;
-    uint32_t window = g_resume_window;
+    uint32_t window = 0;
     if (g_resume_pending && (double)(mach_absolute_time() - g_resume_since) > RESUME_MAX_GAP_S * 1000.0 * ticks_per_ms())
         g_resume_pending = false;   /* back long after the unplug: not the same session */
     if (ok && !atomic_load(&g_io_running) && !atomic_load(&g_boot_mode)) {
         set_idle_routing();   /* thru, or as before the unplug if a client was streaming */
         resuming = g_resume_pending;
+        /* A fallback of its own: one left from an earlier replug (the box unplugged again before the
+           stream restarted) must not put the decks on thru early; on_usb_removed moves the window on too. */
+        if (resuming) window = ++g_resume_window;
         send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
     }
     pthread_mutex_unlock(&g_mutex);
@@ -2308,9 +2312,11 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
             for (int d = 0; d < SL3_NDECKS; d++) g_resume_source[d] = g_st.thru[d] ? 0 : 1;
             ST_UNLOCK();
             g_resume_pending = true;
-            g_resume_window++;
             g_resume_since = mach_absolute_time();
         }
+        /* Any fallback still waiting belongs to a replug that has just ended: the next replug restores
+           the routing and waits again. */
+        g_resume_window++;
         usb_close_all();
         /* The device leaves the HAL's list with the box, and a client using it again after a
            replug sends a new StartIO: start counting clients from zero. */
