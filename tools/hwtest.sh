@@ -175,7 +175,7 @@ s0=$(sens)
 if [ -z "$s0" ]; then
     record FAIL "phono sensitivity" "not reported"
 else
-    s1=$(awk -v s="$s0" 'BEGIN { printf "%.1f", s < 10 ? s + 0.5 : s - 0.5 }')
+    s1=$(awk -v s="$s0" 'BEGIN { printf "%.1f", (s < 10 ? s + 0.5 : s - 0.5) }')
     "$PANEL" sens left "$s1" >/dev/null; got=$(sens)
     "$PANEL" sens left "$s0" >/dev/null; back=$(sens)
     [ "$got" = "$s1" ] && [ "$back" = "$s0" ] && record PASS "phono sensitivity" "$s0 -> $s1 -> $s0 mV"         || record FAIL "phono sensitivity" "$s0 -> '$got' -> '$back' mV"
