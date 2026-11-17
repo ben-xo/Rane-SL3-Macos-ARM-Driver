@@ -1,0 +1,9 @@
+#!/bin/sh
+# Remove the previous driver (it is replaced whole), Rane's "SL 3 Audio Control Panel" System Settings
+# pane, which earlier versions of this package installed (the SL 3 Control Panel app replaces it), and
+# the "Rane SL3 Stems & FX" app an earlier version installed.
+rm -rf "/Library/Audio/Plug-Ins/HAL/SL3Device.driver"
+rm -rf "/Library/PreferencePanes/SL 3 Audio Control Panel.prefPane"
+rm -rf "/Applications/Rane SL3 Stems & FX.app"
+rm -rf "/Applications/Rane SL3 Stems & FX.localized"
+exit 0

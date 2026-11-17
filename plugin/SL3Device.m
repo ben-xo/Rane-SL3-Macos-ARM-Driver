@@ -1,280 +1,2548 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * SL3 Core Audio device: an AudioServerPlugIn that drives the SL3 directly
- * through IOUSBHost and publishes it as one 6-in/6-out device at 44.1 or 48 kHz.
+ * SL3Device.m — Complete Self-Contained CoreAudio HAL Driver for Rane SL 3
  *
- * The device runs on the SL3's own clock: its sample time is the count of
- * captured frames, and GetZeroTimeStamp maps sample time to host time with
- * the controller timestamps of the capture transfers. No resampling here;
- * Core Audio handles clock drift against other devices like any USB device.
+ * Drives the Rane SL 3 USB 2.0 DJ audio interface directly from inside the
+ * CoreAudio HAL plugin (coreaudiod) using Apple's modern IOUSBHost framework.
+ * No external daemon, no kernel extension, no root helper required.
  *
- * Rings are indexed by device sample time, with a per-frame stamp holding
- * the sample time last written to that slot, so stale or missing frames
- * read as silence.
- *
- * USB session (interfaces 1-3, heartbeat, switch bytes) follows
- * src/iousbhost_streams.m. It starts on the first StartIO and stops on the
- * last StopIO, handing the decks back to thru.
- *
- * Log: log stream --predicate 'subsystem == "sl3.device"'
+ * Capabilities:
+ *   - 6-channel 24-bit (packed, 3 bytes) / 44.1 & 48 kHz Isochronous USB Audio: channels 1-2 Aux,
+ *     3-4 Left deck, 5-6 Right deck
+ *   - Low-latency playback: transfers queued 128 ms ahead, audio written into them shortly
+ *     before they play; packet sizes predicted from the box's clock and steered to match capture
+ *     (docs/SL3-AUDIO-ENGINE.md)
+ *   - Automatic USB Audio / Analog Thru switching on StartIO / StopIO (control bytes 8/14/20, HID 0x33)
+ *   - Full HID Command/Response + Unsolicited Report Queue ('sl3h', 'sl3s', 'sl3q')
+ *     for Serato DJ Pro (Sl3Api.framework) and Control Panel
+ *   - Automatic USB Hotplug detection (plug / unplug at any time): the device is listed only
+ *     while a box is attached, and the decks are put on analogue thru when it connects
+ *   - Bootloader detection: a box whose EEPROM is marked not bootable enumerates as the EZ-USB's
+ *     default device (no strings) and passes no audio. The driver detects this and reports it —
+ *     in the log and via a boot_mode flag in the 'sl3s' status — so a client can tell the box
+ *     needs its firmware restored.
  */
-#import <Foundation/Foundation.h>
-#import <IOKit/IOKitLib.h>
-#import <IOUSBHost/IOUSBHost.h>
-#include <CoreAudio/AudioServerPlugIn.h>
-#include <mach/mach_time.h>
-#include <mach/thread_policy.h>
-#include <os/log.h>
-#include <pthread.h>
-#include <stdatomic.h>
 
-#define VID 0x1cc5
-#define PID 0x0001
-#define IF_PLAY 1
-#define IF_CAP  2
-#define IF_HID  3
-#define EP_PLAY 0x06
-#define EP_CAP  0x82
-#define EP_HID_OUT 0x01
-#define EP_HID_IN  0x81
-#define HID_REPORT 64
-#define HEARTBEAT_MS 100
-#define NCH 6
-#define FRAME_BYTES 18
-#define PKT_MAX 126
-/* Sample rate: 44.1 or 48 kHz, set on the box with 0x31 at every start (the
- * box keeps its rate across power cycles, so it can't be assumed). */
-static double g_rate_hz = 44100;
-#define RATE g_rate_hz
-#define RATE_KEY CFSTR("sample rate")
-#define CAP_PKTS 8      /* microframes per transfer: 1 ms, must be a multiple of 8 */
-#define CAP_NXF 64      /* 64 ms of capture queued */
-#define PLAY_PKTS 8
-/* Deep-schedule playback queue depth in ms (64 transfers of 1 ms queued ahead;
- * WriteMix writes late directly into the queued transfer buffers ~3 ms before playback). */
-#ifndef PLAY_NXF
-#define PLAY_NXF 64
+#import <Foundation/Foundation.h>
+#import <CoreAudio/AudioServerPlugIn.h>
+#import <IOKit/IOKitLib.h>
+#import <IOKit/usb/IOUSBLib.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/IOMessage.h>
+#import <IOUSBHost/IOUSBHost.h>
+#include <mach/mach_time.h>
+#include <pthread.h>
+#include <os/log.h>
+#include <os/lock.h>
+#include "SL3Status.h"
+#include <stdatomic.h>
+#include <math.h>
+
+#ifndef SL3_VERSION
+#define SL3_VERSION  "1.4.0"
 #endif
-#define RING 16384       /* frames, power of two */
-#define ZTS_PERIOD 16384 /* frames between zero timestamps (>= 10923 required by CoreAudio HAL) */
-/* Safety offsets (frames at 44.1 kHz, scaled with the rate):
- * With early capture read + deep-scheduled late-write playback:
- *   IN_SAFETY  = 176 frames (~4.0 ms)
- *   OUT_SAFETY = 132 frames (~3.0 ms)
- *   LAT_IN     = 23  frames (~0.5 ms)
- *   LAT_OUT    = 66  frames (~1.5 ms) */
-#ifndef IN_SAFETY
-#define IN_SAFETY  176
-#endif
-#ifndef OUT_SAFETY
-#define OUT_SAFETY 132
-#endif
-#define AT_RATE(f) ((UInt32)llround((f) * RATE / 44100.0))
-#ifndef LAT_IN
-#define LAT_IN  23
-#endif
-#ifndef LAT_OUT
-#define LAT_OUT 66
-#endif
+#define VID          0x1cc5
+#define PID          0x0001
+#define IF_PLAY      1
+#define IF_CAP       2
+#define IF_HID       3
+#define EP_PLAY      0x06    /* IF1 alt1: isochronous OUT, asynchronous, bInterval 1 */
+#define EP_CAP       0x82    /* IF2 alt1: isochronous IN, implicit feedback, bInterval 1 */
+#define EP_HID_OUT   0x01
+#define EP_HID_IN    0x81
+
+#define NCH          6
+#define SAMPLE_BYTES 3       /* 24-bit samples, little-endian, packed (no pad byte) */
+#define FRAME_BYTES  (NCH * SAMPLE_BYTES)   /* 18 */
+#define PKT_MAX      126     /* wMaxPacketSize of EP 0x06/0x82: 7 frames * 18 bytes per microframe */
+#define CAP_PKTS     8       /* 1 ms per transfer */
+#define CAP_NXF      64
+#define PLAY_PKTS    8       /* 1 ms per transfer */
+#define RING_FRAMES  65536   /* ~1.36s @ 48kHz */
+#define RING_MASK    (RING_FRAMES - 1)
+
+/* Custom CoreAudio Property Selectors */
+#define kSL3PropHIDCommand  'sl3h'   /* CFDataRef (64B cmd in -> 64B reply out) */
+#define kSL3PropStatus      'sl3s'   /* CFDataRef (SL3StatusPacket out) */
+#define kSL3PropUnsolQueue  'sl3q'   /* CFDataRef (this client's queued 64B reports, oldest first) */
+#define kSL3PropMeters      'sl3m'   /* CFDataRef (12 Float32: peak level of inputs 1-6, then outputs 1-6) */
+#define kSL3PropInSafety    'sl3i'   /* CFNumberRef (int): the input safety offset setting in us; set with nothing streaming */
+
+/* The box's HID protocol (docs/SL3-COMMANDS.md). Every command and reply is one 64-byte report:
+   [0] = command, [1..4] = tag (echoed in every reply, rejections included), [5..] = arguments /
+   results. Commands marked (!) write the box's boot EEPROM or make it leave the USB bus: the driver
+   never sends them itself, and passes them on from clients as Rane's driver did. */
+enum {
+    HID_REPORT_LEN         = 64,
+    HID_MAX_ARGS           = HID_REPORT_LEN - 5,
+    SL3_CMD_VERSION        = 0x01,   /* reply [5] major, [6] minor, [7..10] build stamp (BE) */
+    SL3_CMD_EEPROM_WRITE   = 0x02,   /* (!) [5..6] address, [7..38] 32 bytes; refused (0xFF) unless 0x17 enabled it */
+    SL3_CMD_EEPROM_READ    = 0x03,   /* [5..6] address -> reply [5..6] address, [7..38] 32 bytes */
+    SL3_CMD_NO_REPLY       = 0x06,   /* the box sends no reply */
+    SL3_CMD_USB_STATE      = 0x0a,   /* reply [5]: 0 unconfigured, 1 full-speed configuration, 2 high speed */
+    SL3_CMD_BOOTABLE       = 0x16,   /* (!) mark the EEPROM bootable and restart the box */
+    SL3_CMD_NOT_BOOTABLE   = 0x17,   /* (!) mark the EEPROM not bootable, enable 0x02 */
+    SL3_CMD_ALT_PID        = 0x1a,   /* (!) re-enumerate as product ID 0x0003 until power-cycled */
+    SL3_CMD_NORMAL_PID     = 0x1b,   /* (!) re-enumerate as product ID 0x0001 */
+    SL3_CMD_GET_RATE       = 0x30,   /* reply [5..6] rate, big-endian */
+    SL3_CMD_SET_RATE       = 0x31,   /* [5..6] rate, big-endian: 44100 or 48000 (the box powers up at 44100) */
+    SL3_CMD_GET_CONTROLS   = 0x32,   /* reply [5..26] the 22 control bytes (SL3_CTL_*) */
+    SL3_CMD_SET_CONTROLS   = 0x33,   /* [5] first index, [6] count, [7..] values; reply carries no status */
+    SL3_CMD_GET_OVERLOAD   = 0x35,   /* reply [5..10] six overload flags */
+    SL3_CMD_REPORTS        = 0x36,   /* [5] non-zero: send unsolicited reports (cleared at every enumeration) */
+    SL3_CMD_CHALLENGE      = 0x37,   /* [5..12] challenge -> reply [5..12] response */
+    SL3_REPORT_OVERLOAD    = 0x34,   /* the box's unsolicited reports: [1..3] 0, [4] report number, then: */
+    SL3_REPORT_PHONO       = 0x38,   /*   [5..7] control bytes 0-2: the LINE/PHONO switches (1 = phono) */
+    SL3_REPORT_THRU        = 0x39,   /*   [5..8] control bytes 8, 14, 20 (1 = USB, 0 = thru) and 21 */
+    SL3_REJECTED           = 0xFF,   /* reply to a command the box refuses */
+    /* Debug commands (debug build only): handled by the driver, never sent to the box. */
+    SL3_CMD_DEBUG_FIRST    = 0xF0,   /* this and above are debug commands; a release build refuses them */
+    SL3_CMD_DBG_STALL      = 0xF3,   /* [5..6] ms, big-endian: hold the USB queue this long, once */
+    SL3_CMD_DBG_ERRPKTS    = 0xF4,   /* [5] n: treat the next n capture packets as errored */
+    SL3_CMD_DBG_NOEARLY    = 0xF5,   /* [5] 1: the early reader places nothing; 0: back on */
+    /* Reports the driver makes itself (not from the box), queued for clients like the box's: */
+    SL3_EVT_SAMPLE_RATE    = 0x4F,   /* [5..7] rate, big-endian */
+};
+/* The control bytes (0x32 / 0x33): a block of six per deck, in the box's order Aux, Left, Right. */
+enum {
+    SL3_CONTROLS_LEN       = 22,
+    SL3_CTL_LINE_PHONO     = 0,      /* 0-2: each deck's LINE/PHONO switch, physical (reported only) */
+    SL3_CTL_BLOCK          = 3,      /* 3-8 Aux, 9-14 Left, 15-20 Right: */
+    SL3_CTL_BLOCK_LEN      = 6,
+    SL3_CTL_SENSITIVITY    = 0,      /*   +0 phono sensitivity 0-15 (2.5 + 0.5 n mV), kept in the box's EEPROM */
+    SL3_CTL_SOURCE         = 5,      /*   +5 output source: 1 = USB audio, 0 = analogue thru */
+    SL3_CTL_EXT_POWER      = 21,     /* 21: external power input (reported only) */
+};
+#define SL3_NDECKS           3
+#define SL3_CTL_SOURCE_AT(d) (SL3_CTL_BLOCK + (d) * SL3_CTL_BLOCK_LEN + SL3_CTL_SOURCE)   /* 8, 14, 20 */
+#define SL3_BOOTSTRAP_VERSION 0x0219 /* 0x01's reply from Rane's RAM-loaded EEPROM writer (2.25): no audio */
+
 
 enum {
     kObjPlugIn    = kAudioObjectPlugInObject,
     kObjDevice    = 2,
     kObjStreamIn  = 3,
     kObjStreamOut = 4,
-    kObjVolume    = 5,   /* master output volume (element 0) */
-    kObjMute      = 6,   /* master output mute   (element 0) */
-    kObjVolCh1    = 7,   /* Aux Out L       (element 1) */
-    kObjVolCh2    = 8,   /* Aux Out R       (element 2) */
-    kObjVolCh3    = 9,   /* Left Deck Out L (element 3) */
-    kObjVolCh4    = 10,  /* Left Deck Out R (element 4) */
-    kObjVolCh5    = 11,  /* Right Deck Out L (element 5) */
-    kObjVolCh6    = 12,  /* Right Deck Out R (element 6) */
+    kObjVolume    = 5,   /* output master volume */
+    kObjMute      = 6,   /* output master mute */
+    kObjVolCh1    = 7,   /* output volume, channels 1-6 */
+    kObjVolCh2    = 8,
+    kObjVolCh3    = 9,
+    kObjVolCh4    = 10,
+    kObjVolCh5    = 11,
+    kObjVolCh6    = 12,
 };
-#define DEVICE_UID CFSTR("SL3Device_UID")
-#define MODEL_UID  CFSTR("SL3Device_Model")
 
 static os_log_t g_log;
-static AudioServerPlugInHostRef g_host;
-static ULONG g_refs = 1;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_io_clients;        /* StartIO count */
-static double g_tick_ns;        /* ns per mach tick */
+#define LOG(fmt, ...) os_log(g_log, "[SL3] " fmt, ##__VA_ARGS__)
 
-/* ---- sample-time rings ---- */
-typedef struct {
-    float buf[RING * NCH];
-    _Atomic uint64_t stamp[RING];   /* sample time + 1 written to this slot; 0 = never */
-} sring_t;
-static sring_t g_in, g_out;
+/* Debug build (make plugin DEBUG=1): streaming diagnostics (counters, timing histograms, periodic
+   "DBG" log lines) and the 'sl3h' debug commands 0xF3-0xF5 (test hooks,
+   handled by the driver and never sent to the box; see dbg_command). A release build compiles
+   none of it, and refuses every 'sl3h' command from 0xF0 up. */
+#ifndef SL3_DEBUG
+#define SL3_DEBUG 0
+#endif
+#if SL3_DEBUG
+#define DBG_LOG(fmt, ...) LOG(fmt, ##__VA_ARGS__)
+#define DBG_DO(stmt)      do { stmt; } while (0)
+#else
+#define DBG_LOG(fmt, ...) do { } while (0)
+#define DBG_DO(stmt)      do { } while (0)
+#endif
 
-static void sring_put(sring_t *r, uint64_t s, const float *fr) {
-    unsigned i = s & (RING - 1);
-    memcpy(&r->buf[i * NCH], fr, sizeof(float) * NCH);
-    atomic_store_explicit(&r->stamp[i], s + 1, memory_order_release);
+#if SL3_DEBUG
+/* Debug-only state. The counters and histograms describe one stream: dbg_reset clears them when
+   it starts. The test hooks are set by the 'sl3h' debug commands (dbg_command). */
+static uint32_t dbg_capdelay_hist[24];   /* capture handler time - bus start of its frame: 0.5 ms bins from -2 ms */
+static double   dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max;
+static uint32_t dbg_cap_pkt_err;         /* capture packets dropped: error status or impossible length */
+static uint32_t dbg_cap_pkt_frames[PKT_MAX / FRAME_BYTES + 1];   /* good capture packets by frames carried */
+static _Atomic uint32_t dbg_dp_written, dbg_dp_late, dbg_dp_unscheduled;   /* WriteMix samples, IO thread */
+/* The HAL's WriteMix calling pattern (see SL3_DoIOOperation): thread switches, concurrent calls,
+   and samples written to positions already written */
+static _Atomic uint32_t dbg_wm_thread_switches, dbg_wm_concurrent, dbg_wm_rewritten;
+static _Atomic uint64_t dbg_wm_last_thread, dbg_wm_high;
+static uint32_t dbg_dp_enq_fail, dbg_dp_resync, dbg_dp_retry_later, dbg_dp_n;   /* deep schedule, g_q */
+static double   dbg_dp_err_max;
+/* Test hooks */
+static _Atomic uint32_t dbg_stall_ms;      /* 0xF3: hold the USB queue (g_q) this many ms, once */
+static _Atomic uint32_t dbg_err_pkts;      /* 0xF4: treat this many more capture packets as errored */
+static _Atomic bool     dbg_no_early;      /* 0xF5: the early reader places nothing, as where it can't work */
+
+static void dbg_er_reset(void);
+static void dbg_er_log(const char *what);
+static void dbg_reset(void) {
+    dbg_er_reset();
+    memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
+    dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
+    dbg_cap_pkt_err = 0;
+    memset(dbg_cap_pkt_frames, 0, sizeof dbg_cap_pkt_frames);
+    dbg_dp_written = dbg_dp_late = dbg_dp_unscheduled = 0;
+    dbg_wm_thread_switches = dbg_wm_concurrent = dbg_wm_rewritten = 0;
+    dbg_wm_last_thread = dbg_wm_high = 0;
+    dbg_dp_enq_fail = dbg_dp_resync = dbg_dp_retry_later = dbg_dp_n = 0;
+    dbg_dp_err_max = 0;
 }
-static int sring_get(sring_t *r, uint64_t s, float *fr) {
-    unsigned i = s & (RING - 1);
-    if (atomic_load_explicit(&r->stamp[i], memory_order_acquire) != s + 1) { memset(fr, 0, sizeof(float) * NCH); return 0; }
-    memcpy(fr, &r->buf[i * NCH], sizeof(float) * NCH);
-    return 1;
+
+/* Test hook 0xF4: true if this capture packet should be treated as errored. */
+static bool dbg_take_err_pkt(void) {
+    uint32_t n = atomic_load(&dbg_err_pkts);
+    while (n > 0 && !atomic_compare_exchange_weak(&dbg_err_pkts, &n, n - 1)) {}
+    return n > 0;
 }
-static void sring_clear(sring_t *r) { for (int i = 0; i < RING; i++) atomic_store(&r->stamp[i], 0); }
+#endif
 
-static struct { long cap_err, play_err, xfer_err, in_miss, out_miss, hb_sent, hb_replies, resyncs, in_jumps, out_jumps, play_resyncs; double max_err_us, rate, max_delay_ms; } S;
+static AudioServerPlugInHostRef g_host = NULL;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_hid_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_hout_mtx = PTHREAD_MUTEX_INITIALIZER;   /* writes to the HID OUT pipe */
+static pthread_mutex_t g_unsol_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-/* ---- clock model: host ticks = a_host + (sample - a_s) * tpf ---- */
-static struct { _Atomic uint32_t seq; double a_s, a_host, tpf; uint64_t seed; int valid; } g_clk;
+/* The sample rate: 48 kHz unless chosen otherwise, as Rane's driver set it (and the rate Serato DJ
+   Pro 2.5.5's description of the SL 3 asks for). The box powers up at 44.1 kHz, so the driver sets it
+   at every connect. The choice is kept in the plug-in's storage (rate_load / rate_save). */
+#define RATE_STORAGE_KEY CFSTR("sample rate")
+static Float64  g_sr = 48000.0;
+static UInt32   g_io_clients = 0;
+#define IO_CLIENTS_MAX 64
+static UInt32   g_io_cids[IO_CLIENTS_MAX];   /* the client IDs counted in g_io_clients (g_mutex); cleared with
+                                                it at an unplug, so a StopIO for a session from before the
+                                                unplug is told from one for a client started since */
+static _Atomic bool g_io_running = false;
+/* Stream generation: bumped when a stream starts and when it stops. Every USB completion and
+   retry carries the generation it was queued in and does nothing once it has moved on, so work
+   left over from a stopped stream can never touch the next one. */
+static _Atomic uint32_t g_stream_gen = 0;
+static bool stream_live(uint32_t gen) {
+    return atomic_load(&g_io_running) && atomic_load(&g_stream_gen) == gen;
+}
+static _Atomic bool g_hw_connected = false;
+static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
+static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
+static _Atomic uint64_t g_dev_regid;         /* registry entry ID of the device g_dev opened, 0 if none */
+static _Atomic bool g_bootstrap_open = false;   /* the box the driver has open is running Rane's bootstrap */
+static uint32_t g_ref_count = 0;
 
-static void clk_read(double *a_s, double *a_host, double *tpf, uint64_t *seed, int *valid) {
-    static __thread double last_s, last_h, last_tpf;
-    static __thread uint64_t last_seed;
-    static __thread int last_valid;
-    for (int tries = 0; tries < 64; tries++) {
-        uint32_t q = atomic_load_explicit(&g_clk.seq, memory_order_acquire);
-        if (q & 1) continue;
-        double s = g_clk.a_s, h = g_clk.a_host, t = g_clk.tpf;
-        uint64_t sd = g_clk.seed;
-        int v = g_clk.valid;
+/* Capture ring buffer (Float32 interleaved, NCH channels), indexed by timeline position */
+static float g_in_ring[RING_FRAMES * NCH];
+
+/* The HAL's timeline (GetZeroTimeStamp), as a line: sample g_clk_sample at host time g_clk_host,
+   advancing one sample every g_clk_tpf host ticks. It starts at sample 0 when streaming starts and
+   must never jump (the HAL resets its clock if its timestamps fall off the line), but it must
+   follow the box's own clock, or playback, which runs at the box's rate, drifts against it.
+   So every CLK_FIX_FRAMES captured frames, clk_track re-anchors the line where it is (keeping it
+   continuous) and sets its rate to the box's measured rate plus a correction that pulls the line
+   onto the box's actual frame count over CLK_CORR_S seconds. clk_track (g_q) writes it while
+   streaming and clk_reset (HAL threads, with streaming stopped) restarts it; GetZeroTimeStamp (the
+   HAL's IO thread) reads it, so it is published under a sequence lock.
+
+   Capture begins some milliseconds after the timeline starts: the first captured frame sits at
+   the timeline position matching its arrival (g_cap_base), and the box's rate is measured from
+   that frame's time (g_rate_anchor). These and g_clk_last_fix are touched only on g_q. */
+#define CLK_FIX_FRAMES 2048
+/* GetZeroTimeStamp's period: AudioServerPlugIn.h requires at least 10923 frames (Apple's sample
+   drivers use 16384). Unrelated to CLK_FIX_FRAMES: the timeline itself is a continuous line. */
+#define ZTS_PERIOD_FRAMES 16384
+#define CLK_CORR_S     2.0
+static mach_timebase_info_data_t g_tb;
+static _Atomic uint32_t g_clk_seq = 0;
+static uint64_t g_clk_host = 0;
+static double   g_clk_sample = 0;
+static double   g_clk_tpf = 0;
+static uint64_t g_rate_anchor = 0;
+static uint64_t g_cap_base = 0;
+static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_track correction */
+
+/* Input safety offset. It covers the early read (see "Early read"), not completion delivery: at
+   1.5 ms, ReadInput found every frame it was asked for at least 0.6 ms early, idle and under load
+   (measured).
+   - g_in_safety_set_us is the setting: 'sl3i', kept in the plug-in's storage so it survives restarts.
+   - Where the early read turns out not to work (early_read_judge), the driver says so (the log and
+     the status) and IN_SAFETY_SAFE_US is the setting to choose; it doesn't change it by itself,
+     which would take the device away from apps holding it.
+   - The HAL reads the offset only when it sets the device up, so g_in_safety_us, the value the
+     property reports, changes only just before the device is listed (in_safety_apply): it is always
+     the value the HAL is using. */
+#define IN_SAFETY_DEFAULT_US   1500
+#define IN_SAFETY_SAFE_US      8000   /* covers completion delivery, for where the early read doesn't work */
+#define IN_SAFETY_MIN_US       500
+#define IN_SAFETY_MAX_US       20000
+#define IN_SAFETY_STORAGE_KEY  CFSTR("input safety offset us")
+static _Atomic int  g_in_safety_set_us = IN_SAFETY_DEFAULT_US;
+static _Atomic int  g_in_safety_us = IN_SAFETY_DEFAULT_US;
+/* Just before the device is listed, so the HAL reads it as it sets the device up. */
+static void in_safety_apply(void) {
+    atomic_store(&g_in_safety_us, atomic_load(&g_in_safety_set_us));
+}
+/* The setting, from and to the plug-in's storage (the HAL keeps it for the plug-in). */
+static void in_safety_load(void) {
+    CFPropertyListRef v = NULL;
+    if (!g_host || g_host->CopyFromStorage(g_host, IN_SAFETY_STORAGE_KEY, &v) != 0 || !v) return;
+    int us = 0;
+    if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &us) &&
+        us >= IN_SAFETY_MIN_US && us <= IN_SAFETY_MAX_US)
+        atomic_store(&g_in_safety_set_us, us);
+    CFRelease(v);
+}
+static void in_safety_save(void) {
+    if (!g_host) return;
+    int us = atomic_load(&g_in_safety_set_us);
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &us);
+    if (!n) return;
+    g_host->WriteToStorage(g_host, IN_SAFETY_STORAGE_KEY, n);
+    CFRelease(n);
+}
+/* The sample rate, from and to the plug-in's storage. */
+static void rate_load(void) {
+    CFPropertyListRef v = NULL;
+    if (!g_host || g_host->CopyFromStorage(g_host, RATE_STORAGE_KEY, &v) != 0 || !v) return;
+    double r = 0;
+    if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberDoubleType, &r) &&
+        (r == 44100.0 || r == 48000.0))
+        g_sr = r;
+    CFRelease(v);
+}
+static void rate_save(void) {
+    if (!g_host) return;
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberDoubleType, &g_sr);
+    if (!n) return;
+    g_host->WriteToStorage(g_host, RATE_STORAGE_KEY, n);
+    CFRelease(n);
+}
+static UInt32 in_safety_frames(void) {
+    return (UInt32)(atomic_load(&g_in_safety_us) * g_sr / 1e6 + 0.5);
+}
+/* Output timing, reported to the HAL (see "Deep-schedule playback" below): every sample plays
+   DP_OUT_LATENCY_MS after its timeline position, and the HAL writes DP_OUT_SAFETY_MS ahead. */
+#define DP_OUT_SAFETY_MS  2.0
+#define DP_OUT_LATENCY_MS 1.5
+/* The rest of the round trip is the box's (its FIFOs and converters): measured through a loopback
+   cable on an SL 3 (firmware 2.31) as 73-74 frames at both rates, beyond the output latency. The
+   output stream's 32 frames and this make 76, slightly over, as reported latency should be. */
+#define IN_DEVICE_LATENCY_FRAMES 44
+static UInt32 out_safety_frames(void) {
+    return (UInt32)(DP_OUT_SAFETY_MS * g_sr / 1000.0 + 0.5);
+}
+static UInt32 out_latency_frames(void) {
+    return (UInt32)(DP_OUT_LATENCY_MS * g_sr / 1000.0 + 0.5);
+}
+static _Atomic uint64_t g_total_cap_frames = 0;
+static _Atomic uint64_t g_total_play_frames = 0;
+static _Atomic uint64_t g_zts_seed = 1;     /* GetZeroTimeStamp seed: bumped when the timeline changes */
+
+static double nominal_tpf(void) {
+    return ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
+}
+
+/* Read the timeline consistently. Bounded, because the HAL's IO thread reads it: if the writer is
+   preempted mid-update, after 64 tries use the last copy any reader got rather than spin. (That
+   copy is a plain static, not thread-local: thread-local storage in a loaded bundle can allocate
+   on first use, which the real-time IO thread must not do. A torn fallback is harmless: it is
+   only used in that rare case, and the line it describes moves by a fraction of a frame.) */
+static _Atomic uint64_t g_clk_last_h;
+static _Atomic double   g_clk_last_s, g_clk_last_tpf;
+static void clk_get(uint64_t *host, double *sample, double *tpf) {
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = atomic_load_explicit(&g_clk_seq, memory_order_acquire);
+        uint64_t h = g_clk_host; double s = g_clk_sample, t = g_clk_tpf;
         atomic_thread_fence(memory_order_acquire);
-        if (atomic_load_explicit(&g_clk.seq, memory_order_relaxed) == q) {
-            *a_s = last_s = s; *a_host = last_h = h; *tpf = last_tpf = t;
-            *seed = last_seed = sd; *valid = last_valid = v;
+        uint32_t s2 = atomic_load_explicit(&g_clk_seq, memory_order_relaxed);
+        if (!(s1 & 1) && s1 == s2) {
+            *host = h; *sample = s; *tpf = t;
+            atomic_store_explicit(&g_clk_last_h, h, memory_order_relaxed);
+            atomic_store_explicit(&g_clk_last_s, s, memory_order_relaxed);
+            atomic_store_explicit(&g_clk_last_tpf, t, memory_order_relaxed);
             return;
         }
     }
-    *a_s = last_s; *a_host = last_h; *tpf = last_tpf ? last_tpf : (1e9 / RATE / g_tick_ns);
-    *seed = last_seed; *valid = last_valid;
-}
-static void clk_write(double a_s, double a_host, double tpf, int new_seed) {
-    atomic_fetch_add_explicit(&g_clk.seq, 1, memory_order_acq_rel);
-    g_clk.a_s = a_s; g_clk.a_host = a_host; g_clk.tpf = tpf; g_clk.valid = 1;
-    if (new_seed) g_clk.seed++;
-    atomic_fetch_add_explicit(&g_clk.seq, 1, memory_order_release);
-}
-static double clk_sample_at(double host) {
-    double a_s, a_h, tpf; uint64_t seed; int v;
-    clk_read(&a_s, &a_h, &tpf, &seed, &v);
-    return a_s + (host - a_h) / tpf;
+    *host = atomic_load_explicit(&g_clk_last_h, memory_order_relaxed);
+    *sample = atomic_load_explicit(&g_clk_last_s, memory_order_relaxed);
+    double t = atomic_load_explicit(&g_clk_last_tpf, memory_order_relaxed);
+    *tpf = t > 0 ? t : nominal_tpf();
 }
 
-/* SL3 rate from the oldest and newest of the last RATE_N (timestamp, frames)
- * pairs, one per 100 ms (as rate_est_t in src/sl3bridge.c). */
-#define RATE_N 100
-static struct { double t[RATE_N], f[RATE_N]; int n, i; } g_rate;
-static double rate_add(double t_ms, double frames) {
-    if (g_rate.n && t_ms - g_rate.t[(g_rate.i + RATE_N - 1) % RATE_N] < 100) return 0;
-    g_rate.t[g_rate.i] = t_ms; g_rate.f[g_rate.i] = frames;
-    g_rate.i = (g_rate.i + 1) % RATE_N;
-    if (g_rate.n < RATE_N) g_rate.n++;
-    if (g_rate.n < 20) return 0;
-    int o = (g_rate.i + RATE_N - g_rate.n) % RATE_N, l = (g_rate.i + RATE_N - 1) % RATE_N;
-    double r = (g_rate.f[l] - g_rate.f[o]) / (g_rate.t[l] - g_rate.t[o]) * 1000;
-    return fabs(r / RATE - 1) < 0.01 ? r : 0;
+static void clk_set(uint64_t host, double sample, double tpf) {
+    atomic_fetch_add_explicit(&g_clk_seq, 1, memory_order_acq_rel);   /* odd: update in progress */
+    atomic_thread_fence(memory_order_release);
+    g_clk_host = host; g_clk_sample = sample; g_clk_tpf = tpf;
+    atomic_fetch_add_explicit(&g_clk_seq, 1, memory_order_release);   /* even: consistent again */
 }
 
-static int g_reanchor, g_cap_done;   /* both only touched on the USB queue once streaming */
-
-/* One capture transfer done: frames up to sample s_end were stamped at host tick t_end. */
-static void clk_update(double s_end, double t_end) {
-    double a_s, a_h, tpf; uint64_t seed; int v;
-    clk_read(&a_s, &a_h, &tpf, &seed, &v);
-    double r = rate_add(t_end * g_tick_ns / 1e6, s_end);
-    if (r > 0) tpf = 1e9 / r / g_tick_ns;
-    if (!v || g_reanchor) { g_reanchor = 0; clk_write(s_end, t_end, v ? tpf : 1e9 / RATE / g_tick_ns, 1); return; }
-    if (r > 0) S.rate = r;
-    double pred = a_h + (s_end - a_s) * tpf, err = t_end - pred;
-    if (fabs(err) * g_tick_ns / 1e3 > S.max_err_us) S.max_err_us = fabs(err) * g_tick_ns / 1e3;
-    if (fabs(err) > 2e6 / g_tick_ns) { S.resyncs++; clk_write(s_end, t_end, tpf, 1); return; }   /* >2 ms off: resync */
-    clk_write(s_end, pred + 0.02 * err, tpf, 0);
+/* Start a new timeline: sample 0 is now, at the nominal rate. */
+static void clk_reset(void) {
+    clk_set(mach_absolute_time(), 0, nominal_tpf());
 }
 
-/* ---- USB session ---- */
-#define kSL3PropHIDRequest 'sl3h'
-#define kSL3PropStatus     'sl3s'
-#define kSL3PropMeters     'sl3m'   /* CFDataRef (12 Float32: peak level of inputs 1-6, then outputs 1-6) */
+/* Timeline position (in samples) at host time t. */
+static double clk_sample_at(uint64_t t) {
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    return s + ((double)t - (double)h) / tpf;
+}
 
-/* ---- Deep-schedule late-write ring (256 ms window indexed by USB frame) ---- */
-#define DP_RING 256
-#define DP_MASK (DP_RING - 1)
+/* IOUSBHost state */
+static dispatch_queue_t    g_q;
+static IOUSBHostDevice    *g_dev;
+static IOUSBHostInterface *g_play, *g_cap, *g_hid;
+static IOUSBHostPipe      *g_ppipe, *g_cpipe, *g_hpipe_in, *g_hpipe_out;
+
+/* Isoch transfer pools */
 typedef struct {
-    _Atomic uint64_t seq;
-    uint64_t frame;
-    uint64_t s0;
-    uint32_t total;
-    uint16_t pkt_n[PLAY_PKTS];
-    uint16_t pkt_off[PLAY_PKTS];
-    uint8_t *buf;
-} dp_slot_t;
-static dp_slot_t g_dp_sched[DP_RING];
-static _Atomic uint64_t g_dp_newest_s0;
-static _Atomic uint64_t g_dp_newest_frame;
-static _Atomic int g_dp_active;
-static _Atomic int g_dp_writers;
+    NSMutableData *buf;
+    IOUSBHostIsochronousTransaction *tx;
+} IsoXfer;
+static IsoXfer g_cap_xf[CAP_NXF];
+static uint64_t g_cap_xf_frame[CAP_NXF];   /* USB frame each capture transfer was scheduled for */
+static uint64_t g_cap_frame = 0;
 
-static inline void pack_24le(uint8_t *q, const float *fr) {
-    for (int c = 0; c < NCH; c++) {
-        float v = fr[c] > 1.0f ? 1.0f : fr[c] < -1.0f ? -1.0f : fr[c];
-        int32_t x = (int32_t)lrintf(v * 8388607.0f);
-        q[c * 3]     = (uint8_t)x;
-        q[c * 3 + 1] = (uint8_t)(x >> 8);
-        q[c * 3 + 2] = (uint8_t)(x >> 16);
+/* HID state */
+static NSMutableData *g_hbuf_in;
+static _Atomic uint32_t g_seq = 1;   /* the tag of the next HID command (hid_cmd) */
+static dispatch_semaphore_t g_hid_sem;
+/* The command hid_cmd is waiting for a reply to (g_hid_mtx serialises commands; hid_read on g_q
+   fills the reply and signals g_hid_sem) */
+static _Atomic bool g_waiting = false;
+static uint8_t  g_wait_cmd = 0;
+static uint32_t g_wait_seq = 0;
+/* Guards the hand-off of a reply: hid_read matches, copies and signals under it, and hid_cmd sets
+   up and gives up its wait under it, so a reply matched to one command can't be signalled after the
+   next one has started waiting. */
+static pthread_mutex_t g_reply_mtx = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t  g_reply_buf[HID_REPORT_LEN];
+static SL3StatusPacket g_st;
+/* g_st's box-state fields are written from the USB queue (reports), the hot-plug queue and client
+   threads: each write, and the copy 'sl3s' returns, is made under g_st_lock, so a client never gets
+   a packet mixed from two updates. Held only for the copy, never across a HID command. */
+static os_unfair_lock g_st_lock = OS_UNFAIR_LOCK_INIT;
+#define ST_LOCK()   os_unfair_lock_lock(&g_st_lock)
+#define ST_UNLOCK() os_unfair_lock_unlock(&g_st_lock)
+
+
+/* Reports for clients (see unsol_push) */
+#define UNSOL_Q_MAX   256
+#define UNSOL_READERS 16
+typedef struct { bool used; pid_t pid; uint64_t cursor; uint64_t last; } UnsolReader;
+static uint8_t  g_unsol_q[UNSOL_Q_MAX][HID_REPORT_LEN];
+static uint64_t g_unsol_w = 0;
+static UnsolReader g_unsol_readers[UNSOL_READERS];
+
+/* 'sl3h': the last reply for each client process, returned (once) by its next read */
+#define HID_CLIENTS 16
+typedef struct { bool used, pending; pid_t pid; uint8_t reply[HID_REPORT_LEN]; uint64_t last; } HidClientReply;
+static HidClientReply g_hid_replies[HID_CLIENTS];
+
+/* IOKit Hotplug watcher */
+static IONotificationPortRef g_notify_port = NULL;
+static io_iterator_t g_added_iter = 0;
+static io_iterator_t g_removed_iter = 0;
+
+/* Reports for clients ('sl3q'): the box's unsolicited reports and the driver's own events, kept in
+   a ring with a running count. Every client process reading 'sl3q' has its own read position,
+   so each one gets every report (as Rane's driver delivers each report to every client); a client
+   that falls more than UNSOL_Q_MAX behind skips to the oldest still kept. */
+static void unsol_push(const uint8_t pkt[HID_REPORT_LEN]) {
+    pthread_mutex_lock(&g_unsol_mtx);
+    memcpy(g_unsol_q[g_unsol_w % UNSOL_Q_MAX], pkt, HID_REPORT_LEN);
+    g_unsol_w++;
+    pthread_mutex_unlock(&g_unsol_mtx);
+}
+
+/* The read position of client process pid (registered at its first read, from now on). */
+static uint64_t *unsol_cursor(pid_t pid) {
+    int oldest = 0;
+    for (int i = 0; i < UNSOL_READERS; i++) {
+        if (g_unsol_readers[i].pid == pid && g_unsol_readers[i].used) {
+            g_unsol_readers[i].last = mach_absolute_time();
+            return &g_unsol_readers[i].cursor;
+        }
+        if (!g_unsol_readers[i].used || g_unsol_readers[i].last < g_unsol_readers[oldest].last) oldest = i;
+    }
+    g_unsol_readers[oldest] = (UnsolReader){ .used = true, .pid = pid, .cursor = g_unsol_w, .last = mach_absolute_time() };
+    return &g_unsol_readers[oldest].cursor;
+}
+
+static void push_sr_unsol(int sr) {
+    uint8_t pkt[HID_REPORT_LEN] = {0};
+    pkt[0] = SL3_EVT_SAMPLE_RATE;
+    pkt[5] = (uint8_t)((sr >> 16) & 0xFF);
+    pkt[6] = (uint8_t)((sr >> 8) & 0xFF);
+    pkt[7] = (uint8_t)(sr & 0xFF);
+    unsol_push(pkt);
+}
+
+/* ============================================================================
+ * USB & HID Engine
+ * ============================================================================ */
+
+/* What a report or reply says about the box's state, into the status packet. */
+static void note_controls(const uint8_t c[SL3_CONTROLS_LEN]) {
+    ST_LOCK();
+    for (int d = 0; d < SL3_NDECKS; d++) {
+        g_st.phono[d] = c[SL3_CTL_LINE_PHONO + d] ? 1 : 0;
+        g_st.thru[d] = c[SL3_CTL_SOURCE_AT(d)] ? 0 : 1;
+    }
+    g_st.ext_power = c[SL3_CTL_EXT_POWER];
+    ST_UNLOCK();
+}
+static void note_report(const uint8_t *b) {
+    ST_LOCK();
+    if (b[0] == SL3_REPORT_OVERLOAD) {
+        memcpy(g_st.overload, b + 5, sizeof g_st.overload);
+    } else if (b[0] == SL3_REPORT_PHONO) {
+        for (int d = 0; d < SL3_NDECKS; d++) g_st.phono[d] = b[5 + d] ? 1 : 0;
+    } else if (b[0] == SL3_REPORT_THRU) {
+        for (int d = 0; d < SL3_NDECKS; d++) g_st.thru[d] = b[5 + d] ? 0 : 1;
+        g_st.ext_power = b[8];
+    }
+    ST_UNLOCK();
+}
+
+/* Keep one read queued on the HID IN pipe (runs on g_q). Each report is either the reply hid_cmd
+   is waiting for, or an unsolicited report from the box,
+   which updates the status and is queued for clients. */
+static void hid_read(void);
+static IOReturn g_hid_read_err;   /* the last HID read error logged, so a repeating one logs once (logging only) */
+/* Queue the next read after ms, if the pipe is still the one it was for (not closed or replaced). */
+static void hid_read_later(IOUSBHostPipe *pipe, int ms) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * NSEC_PER_MSEC), g_q, ^{
+        if (g_hpipe_in == pipe) hid_read();
+    });
+}
+static void hid_read(void) {
+    if (!g_hpipe_in || !g_hbuf_in) return;
+    IOUSBHostPipe *pipe = g_hpipe_in;
+    NSError *e = nil;
+    BOOL queued = [pipe enqueueIORequestWithData:g_hbuf_in completionTimeout:0 error:&e completionHandler:^(IOReturn s, NSUInteger n) {
+        if (s == kIOReturnSuccess && n > 0) {
+            /* The report's command byte [0] and its tag [1..4]. */
+            const uint8_t *b = g_hbuf_in.bytes;
+            uint32_t rseq = 0;
+            memcpy(&rseq, b + 1, 4);
+
+            /* The awaited reply: its command (or a rejection) with its tag. (The box's own reports
+               have opcodes no command uses, so a tag can't make one look like a reply.) */
+            pthread_mutex_lock(&g_reply_mtx);
+            bool reply = atomic_load(&g_waiting) && rseq == g_wait_seq &&
+                         (b[0] == g_wait_cmd || b[0] == SL3_REJECTED);
+            if (reply) {
+                /* Hand it to hid_cmd and wake it. */
+                memcpy(g_reply_buf, b, HID_REPORT_LEN);
+                atomic_store(&g_waiting, false);
+                dispatch_semaphore_signal(g_hid_sem);
+            }
+            pthread_mutex_unlock(&g_reply_mtx);
+
+            /* An unsolicited report: note the switches, thru and overload state, and queue it
+               for clients. */
+            if (!reply && (b[0] == SL3_REPORT_OVERLOAD || b[0] == SL3_REPORT_PHONO || b[0] == SL3_REPORT_THRU)) {
+                note_report(b);
+                unsol_push(b);
+            }
+            /* Anything else is a reply that came after hid_cmd gave up: not for clients. */
+        }
+        /* Queue the next read, unless the pipe was aborted or released (the box is closing). After
+           an error, clear the endpoint's halt and wait a little first, so a pipe that keeps failing
+           doesn't spin on g_q, which also runs the audio completions. */
+        if (s == kIOReturnAborted || g_hpipe_in != pipe) return;
+        if (s == kIOReturnSuccess) { g_hid_read_err = kIOReturnSuccess; hid_read(); return; }
+        if (s != g_hid_read_err) LOG("HID read failed (0x%x): clearing the endpoint and reading again", s);
+        g_hid_read_err = s;
+        [pipe clearStallWithError:nil];
+        hid_read_later(pipe, 10);
+    }];
+    /* Not queued: try again shortly, rather than leave the box's replies and reports unread. */
+    if (!queued) {
+        if (g_hid_read_err != kIOReturnNotReady)
+            LOG("HID read could not be queued (%{public}@): trying again", e.localizedDescription);
+        g_hid_read_err = kIOReturnNotReady;   /* marks "not queued", so a lasting refusal logs once */
+        hid_read_later(pipe, 100);
     }
 }
 
-/* Write a single processed 6-channel frame directly into its already-queued USB transfer buffer. */
-static void dp_write_frame(uint64_t s, const float *fr) {
-    uint64_t nf = atomic_load_explicit(&g_dp_newest_frame, memory_order_acquire);
-    uint64_t ns0 = atomic_load_explicit(&g_dp_newest_s0, memory_order_relaxed);
-    if (!nf) return;
-    int64_t ds = (int64_t)s - (int64_t)ns0;
-    int64_t df = ds / 44;
-    uint64_t start_f = (int64_t)nf + df - 4 > 0 ? (uint64_t)((int64_t)nf + df - 4) : 1;
-    for (int step = 0; step < 12; step++) {
-        uint64_t f = start_f + (uint64_t)step;
-        dp_slot_t *sl = &g_dp_sched[f & DP_MASK];
-        uint64_t q1 = atomic_load_explicit(&sl->seq, memory_order_acquire);
-        if ((q1 & 1) || sl->frame != f) continue;
-        uint64_t s0 = sl->s0;
-        uint32_t tot = sl->total;
-        uint8_t *buf = sl->buf;
-        if (s >= s0 && s < s0 + tot && buf) {
-            uint32_t rem = (uint32_t)(s - s0);
-            for (int k = 0; k < PLAY_PKTS; k++) {
-                uint16_t pn = sl->pkt_n[k];
-                if (rem < pn) {
-                    uint8_t *q = buf + sl->pkt_off[k] + rem * FRAME_BYTES;
-                    pack_24le(q, fr);
+/* Send a command and wait up to 150 ms for its reply. Every command gets one except
+   SL3_CMD_NO_REPLY. The driver always tags the request with its own sequence number (so a reply can
+   never be confused with another's); client_tag, if given, is put back into
+   the reply returned. True if the box answered and accepted the command; reply_out then holds the
+   reply, and holds the rejection (0xFF) if it refused it. */
+static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_out, const uint8_t *client_tag) {
+    if (!g_hpipe_out || !g_hid_sem) return false;
+    /* One command at a time; clear any signal left by a reply to an earlier, abandoned command. */
+    pthread_mutex_lock(&g_hid_mtx);
+    while (dispatch_semaphore_wait(g_hid_sem, DISPATCH_TIME_NOW) == 0) {}   /* drop a late signal */
+
+    /* Build the request. */
+    uint8_t buf[HID_REPORT_LEN] = {0};
+    buf[0] = cmd;
+    uint32_t seq = g_seq++;
+    memcpy(buf + 1, &seq, 4);
+    if (pl && plen > 0) memcpy(buf + 5, pl, plen > HID_MAX_ARGS ? HID_MAX_ARGS : plen);
+    bool wait = cmd != SL3_CMD_NO_REPLY;
+    pthread_mutex_lock(&g_reply_mtx);
+    g_wait_cmd = cmd;
+    g_wait_seq = seq;
+    atomic_store(&g_waiting, wait);
+    pthread_mutex_unlock(&g_reply_mtx);
+
+    /* Send it. */
+    NSMutableData *d = [NSMutableData dataWithBytes:buf length:HID_REPORT_LEN];
+    NSUInteger sent = 0;
+    NSError *e = nil;
+    pthread_mutex_lock(&g_hout_mtx);
+    BOOL ok = [g_hpipe_out sendIORequestWithData:d bytesTransferred:&sent completionTimeout:0 error:&e];
+    pthread_mutex_unlock(&g_hout_mtx);
+    if (!ok) {
+        pthread_mutex_lock(&g_reply_mtx);
+        atomic_store(&g_waiting, false);
+        pthread_mutex_unlock(&g_reply_mtx);
+        pthread_mutex_unlock(&g_hid_mtx);
+        return false;
+    }
+
+    /* Wait for the reply. */
+    bool accepted = true;
+    if (wait) {
+        bool got = dispatch_semaphore_wait(g_hid_sem, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC)) == 0;
+        if (!got) {
+            /* No reply in time: stop waiting, so hid_read doesn't take a late one as the answer,
+               unless it handed one over as the wait ran out (then take it). */
+            pthread_mutex_lock(&g_reply_mtx);
+            if (atomic_load(&g_waiting)) atomic_store(&g_waiting, false);
+            else got = dispatch_semaphore_wait(g_hid_sem, DISPATCH_TIME_NOW) == 0;
+            pthread_mutex_unlock(&g_reply_mtx);
+        }
+        if (got) {
+            if (reply_out) memcpy(reply_out, g_reply_buf, HID_REPORT_LEN);
+            accepted = g_reply_buf[0] != SL3_REJECTED;
+        } else {
+            accepted = false;
+            if (reply_out) memset(reply_out, 0, HID_REPORT_LEN);
+        }
+    } else if (reply_out) {
+        /* A command the box never answers: report a reply of its own command and tag. */
+        memset(reply_out, 0, HID_REPORT_LEN);
+        reply_out[0] = cmd;
+        memcpy(reply_out + 1, &seq, 4);
+    }
+    /* Give a client its own tag back in place of the driver's. */
+    if (reply_out && client_tag) memcpy(reply_out + 1, client_tag, 4);
+    pthread_mutex_unlock(&g_hid_mtx);
+    return accepted;
+}
+
+static void refresh_hw_status(void) {
+    /* Firmware version via HID command 0x01, as Rane's Sl3Api reads it: reply[5] = major, reply[6] =
+       minor (02 32 = 2.50), a 32-bit build stamp at reply[7..10]. Rane's RAM-loaded EEPROM writer
+       enumerates exactly like the running firmware and answers 02 19 (2.25): that box has no audio. */
+    uint8_t r[64];
+    uint8_t maj = 0, min = 0;   /* 0.00, not the previous box's, if this one doesn't answer */
+    for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be booting its DSP */
+        if (hid_cmd(SL3_CMD_VERSION, NULL, 0, r, NULL)) {
+            maj = r[5];
+            min = r[6];
+            break;
+        }
+    }
+    ST_LOCK();
+    g_st.version_maj = maj; g_st.version_min = min;
+    g_st.usb_state = 0;
+    ST_UNLOCK();
+    bool loader = (maj << 8 | min) == SL3_BOOTSTRAP_VERSION;
+    atomic_store(&g_bootstrap_open, loader);
+    if (loader) {
+        atomic_store(&g_boot_mode, true);
+        LOG("Rane SL 3 is running Rane's firmware loader (2.25), not its firmware: no audio until the "
+            "firmware is written and the box restarted.");
+    }
+    /* USB state (0x0a: 1 = full-speed configuration, 2 = high speed). At full speed the box offers
+       only its HID interface, so there is no audio: say so, as the only other sign is a failed
+       stream start. */
+    if (hid_cmd(SL3_CMD_USB_STATE, NULL, 0, r, NULL)) {
+        ST_LOCK(); g_st.usb_state = r[5]; ST_UNLOCK();
+        if (r[5] == 1)
+            LOG("The SL 3 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
+    }
+    /* Serial from the USB iSerialNumber string. It is the same on every SL 3 ("SL3.01.00"); the box
+       has no command that gives a per-unit serial. */
+    CFTypeRef ser = IORegistryEntryCreateCFProperty(g_dev.ioService, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
+    if (ser) {
+        char sb[sizeof g_st.serial] = {0};
+        if (CFGetTypeID(ser) == CFStringGetTypeID() && CFStringGetCString((CFStringRef)ser, sb, sizeof sb, kCFStringEncodingUTF8)) {
+            ST_LOCK(); memcpy(g_st.serial, sb, sizeof sb); ST_UNLOCK();
+        }
+        CFRelease(ser);
+    }
+    /* Enable the box's unsolicited reports (0x36; the box clears this at every enumeration, and drops
+       reports raised while it is off), then read the state they report changes to: the control bytes
+       (LINE/PHONO switches, each deck's output source) and the overload flags. */
+    uint8_t enable[1] = { 1 };
+    hid_cmd(SL3_CMD_REPORTS, enable, 1, NULL, NULL);
+    if (hid_cmd(SL3_CMD_GET_CONTROLS, NULL, 0, r, NULL)) note_controls(r + 5);
+    if (hid_cmd(SL3_CMD_GET_OVERLOAD, NULL, 0, r, NULL)) { ST_LOCK(); memcpy(g_st.overload, r + 5, sizeof g_st.overload); ST_UNLOCK(); }
+}
+
+static void send_hw_samplerate(int sr) {
+    uint8_t pl[2] = { (uint8_t)((sr >> 8) & 0xFF), (uint8_t)(sr & 0xFF) };
+    hid_cmd(SL3_CMD_SET_RATE, pl, 2, NULL, NULL);
+    push_sr_unsol(sr);
+}
+
+/* Switch every deck to USB audio or analogue thru: control bytes 8, 14 and 20 (Aux, Left, Right),
+   one 0x33 each, so the bytes between them are left alone. The box confirms each change with a 0x39
+   report, which reaches clients. */
+/* Each deck's output source as the driver last set it or a client set it through the driver
+   (1 = USB), under g_mutex: what the settle check puts back. Not taken from the box's reports, so a
+   change the box makes by itself (its DSP booting) is still told from one a client chose. */
+static uint8_t g_routing_known[SL3_NDECKS];
+static void set_sources(const uint8_t source[SL3_NDECKS]) {
+    for (int d = 0; d < SL3_NDECKS; d++) {
+        g_routing_known[d] = source[d] ? 1 : 0;
+        uint8_t pl[3] = { (uint8_t)SL3_CTL_SOURCE_AT(d), 1, source[d] ? 1 : 0 };
+        hid_cmd(SL3_CMD_SET_CONTROLS, pl, 3, NULL, NULL);
+        ST_LOCK(); g_st.thru[d] = source[d] ? 0 : 1; ST_UNLOCK();
+    }
+}
+static void set_usb_switches(bool usb_mode) {
+    uint8_t source[SL3_NDECKS];
+    memset(source, usb_mode ? 1 : 0, sizeof source);
+    set_sources(source);
+}
+
+/* The decks' routing across an unplug while a client streams. The box loses it with its power, and the
+   client restarts its stream after the replug (Serato DJ Pro does, by itself) and reads each deck's
+   output source first to decide its own deck modes: putting every deck on thru at connect would put
+   them all in THRU there, and send the turntables' timecode straight to the mixer. So the routing at
+   the unplug is remembered and restored at connect and at the next stream start; if no stream starts
+   within RESUME_WAIT_MS (the app was quit meanwhile), the decks go back on thru. Only for a box back
+   within RESUME_MAX_GAP_S of the unplug (a replug, not a box plugged in again later). All under g_mutex. */
+#define RESUME_WAIT_MS   5000
+#define RESUME_MAX_GAP_S 30
+static uint64_t g_resume_since;                /* host time of the unplug */
+static bool     g_resume_pending;
+static uint8_t  g_resume_source[SL3_NDECKS];   /* each deck's output source at the unplug: 1 = USB */
+static uint32_t g_resume_window;               /* the latest fallback scheduled: an older one, or one whose box has
+                                                  gone again, does nothing */
+/* The routing with nothing streaming: the remembered one while a client is expected back, else thru. */
+static void set_idle_routing(void) {
+    if (g_resume_pending) set_sources(g_resume_source);
+    else set_usb_switches(false);
+}
+
+static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uint8_t fallback1, uint8_t fallback2) {
+    const IOUSBConfigurationDescriptor *cfg = intf.configurationDescriptor;
+    const IOUSBInterfaceDescriptor *ifd = intf.interfaceDescriptor;
+    /* The first isochronous endpoint in direction dir that the interface's descriptors list. */
+    if (cfg && ifd) {
+        const IOUSBEndpointDescriptor *ep = NULL;
+        while ((ep = IOUSBGetNextEndpointDescriptor(cfg, ifd, (const IOUSBDescriptorHeader *)ep)) != NULL) {
+            if (IOUSBGetEndpointDirection(ep) == dir && IOUSBGetEndpointType(ep) == kIOUSBEndpointTypeIsochronous) {
+                NSError *e = nil;
+                IOUSBHostPipe *p = [intf copyPipeWithAddress:ep->bEndpointAddress error:&e];
+                if (p) return p;
+            }
+        }
+    }
+    /* Otherwise the given endpoint addresses, in order. */
+    NSError *e = nil;
+    IOUSBHostPipe *p = [intf copyPipeWithAddress:fallback1 error:&e];
+    if (p) return p;
+    return [intf copyPipeWithAddress:fallback2 error:&e];
+}
+
+/* ============================================================================
+ * Timeline clock: following the box's clock (clk_first_capture, clk_track)
+ * ============================================================================ */
+
+/* First capture of a stream: note when it arrived, and where on the HAL's timeline it belongs. */
+static void clk_first_capture(uint64_t hw_time) {
+    /* Its bus time (now, if there is none) and the timeline position at that time. */
+    uint64_t now = (hw_time > 0) ? hw_time : mach_absolute_time();
+    double pos = clk_sample_at(now);
+    /* The box's rate is measured from here; captured frames go into the ring from pos on. */
+    g_rate_anchor = now;
+    g_cap_base = pos > 0 ? (uint64_t)pos : 0;
+    g_clk_last_fix = 0;
+}
+
+/* A capture transfer delivered `frames` frames, the first of which (captured-frame number
+   count_before) arrived at host time ts. Keep the timeline on the box's clock (see g_clk_*). */
+static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
+    /* Count the frames; correct the line only every CLK_FIX_FRAMES of them. */
+    atomic_fetch_add_explicit(&g_total_cap_frames, frames, memory_order_relaxed);
+    if (!frames || !ts || count_before - g_clk_last_fix < CLK_FIX_FRAMES) return;
+    g_clk_last_fix = count_before;
+
+    /* Where the line is at ts, and how far that is from where the box's frame count puts it. */
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    if (ts <= h) return;
+    double here = s + (double)(ts - h) / tpf;                     /* timeline position at ts */
+    double err  = (double)(g_cap_base + count_before) - here;     /* > 0: timeline behind the box */
+
+    /* The box's average rate since the first capture (nominal until there are enough frames to
+       measure it), plus the correction that removes err over CLK_CORR_S. */
+    double nom_rate = 1.0 / nominal_tpf();                         /* frames per host tick */
+    double elapsed  = (double)(ts - g_rate_anchor);
+    double rate = (count_before >= 8 * CLK_FIX_FRAMES && elapsed > 0) ? (double)count_before / elapsed : nom_rate;
+    double ticks_per_s = 1e9 * (double)g_tb.denom / (double)g_tb.numer;
+    rate += err / (CLK_CORR_S * ticks_per_s);
+
+    /* Keep it within 0.5% of nominal, and re-anchor the line where it is now at that rate. */
+    if (rate > nom_rate * 1.005) rate = nom_rate * 1.005;
+    if (rate < nom_rate * 0.995) rate = nom_rate * 0.995;
+    clk_set(ts, here, 1.0 / rate);
+
+#if SL3_DEBUG
+    static uint32_t dbg_n;
+    if (++dbg_n % 40 == 0)
+        DBG_LOG("DBG clk: phase error %.1f frames (%.3f ms), rate %.1f ppm vs nominal",
+            err, 1000.0 * err / g_sr, (rate / nom_rate - 1.0) * 1e6);
+#endif
+}
+
+
+
+/* ============================================================================
+ * Deep-schedule playback
+ *
+ * USB completions can be delivered 5-30 ms late (the delay is in the USB stack, before any
+ * thread is woken, so no thread priority fixes it). So rather than filling each playback
+ * transfer when an earlier one completes, DP_SLOTS 1 ms transfers are kept queued ahead,
+ * zero-filled, and the HAL's IO thread (WriteMix) writes each sample straight into the queued
+ * transfer that will carry it, shortly before that transfer starts. This works because the
+ * controller reads a transfer's buffer when the transfer starts: audio written into a queued
+ * ioDataWithCapacity: buffer before then is what gets sent. Completions only queue new transfers
+ * at the far end of the schedule, so a stall in completion delivery does not interrupt the audio
+ * unless it outlasts the queue: about 120 ms at small IO buffers (the 128 ms queued, less how far
+ * ahead the HAL writes: about two IO buffers plus the safety offset).
+ *
+ * Each queued USB frame carries a contiguous run of HAL timeline positions, published in
+ * g_dp_sched (indexed by frame number) for the IO thread to look up. When the schedule is
+ * anchored (dp_anchor), its first frame carries the position DP_OUT_LATENCY_MS before that
+ * frame's start time; because the packet sizes follow the box's clock, every sample then plays
+ * DP_OUT_LATENCY_MS after its timeline position. The HAL writes each sample DP_OUT_SAFETY_MS
+ * ahead of "now". Together (3.5 ms) they cover the up-to-1 ms span of positions within a frame
+ * plus DP_WRITE_GUARD_FRAMES (1 ms), leaving 1.5 ms of margin for a late IO thread.
+ *
+ * Packet sizes are fixed when a transfer is queued, ~DP_SLOTS ms before it plays, so they cannot
+ * be copied from the matching capture packets (implicit feedback). They are predicted from the
+ * box's measured rate and steered (dp_track_capture) so that the frames sent through each USB
+ * frame track the frames the box captured through it. A frame whose enqueue is refused is not
+ * sent: its positions move to the next frame (the audio stays continuous) and it does not count
+ * as sent, so the steering makes up the frames the box missed.
+ * ============================================================================ */
+#define DP_SLOTS       128         /* transfers kept queued: 128 ms, covering both how far ahead the HAL
+                                      writes (~2 IO buffers + safety) and completion stalls */
+#define DP_SCHED_N     512         /* schedule ring entries: power of two, >= 2 x (DP_SLOTS + HAL lead) */
+#define DP_START_LEAD  8           /* (re)anchor this many frames ahead of the bus (a transfer only
+                                      4 frames ahead can be refused: 0xe00002ee) */
+#define DP_DRY_LEAD    4           /* the schedule counts as run dry when it reaches less than this far ahead */
+#define DP_CORR_S      1.0         /* sent-vs-captured frame difference is removed over this many seconds */
+#define DP_WRITE_GUARD_FRAMES 1.0  /* a frame is written only if it starts at least this many USB frames
+                                      (1 ms each) from now */
+#define DP_TRIES       4           /* enqueue attempts per call before retrying the slot later */
+
+typedef struct {
+    _Atomic uint64_t frame;        /* USB frame this entry describes, 0 = none (seqlock tag) */
+    uint64_t first;                /* timeline position of the frame's first sample */
+    uint64_t sent_cum;             /* frames queued from the anchor through this frame */
+    uint16_t off[PLAY_PKTS + 1];   /* sample offset of each packet in the frame; [PLAY_PKTS] = total */
+    uint8_t *buf;                  /* the frame's transfer buffer */
+} DPEntry;
+
+/* Shared with WriteMix (the HAL's IO thread): the schedule ring (a seqlock per entry), the
+   transfer buffers it points into, and atomics. Allocated and released by usb_open_all /
+   usb_release_audio, written by dp_submit on g_q. */
+static DPEntry        g_dp_sched[DP_SCHED_N];
+static NSMutableData *g_dp_data[DP_SLOTS];
+static uint8_t       *g_dp_ptr[DP_SLOTS];
+static _Atomic bool     g_dp_active;          /* WriteMix writes into the schedule */
+static _Atomic int      g_dp_writers;         /* WriteMix calls currently inside dp_write */
+static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* current anchor: first position / frame */
+static _Atomic uint64_t g_dp_newest;          /* newest published frame: where WriteMix starts looking */
+
+/* The schedule's bookkeeping, used only on g_q (reset by usb_open_all before capture starts). */
+static IOUSBHostIsochronousTransaction g_dp_tx[DP_SLOTS][PLAY_PKTS];
+static bool     g_dp_started;
+static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum;
+static double   g_dp_acc, g_dp_err;
+
+/* The USB frame clock: microframe g_dp_ref_uframe is associated with host time g_dp_ref_time.
+   Written by dp_ref_refresh (g_q, or usb_open_all before streaming), read on any thread through
+   dp_ref_get (seqlock). */
+static _Atomic uint32_t g_dp_ref_seq;
+static uint64_t g_dp_ref_uframe, g_dp_ref_time, g_dp_last_refresh;
+
+static double ticks_per_ms(void) {
+    return 1e6 * (double)g_tb.denom / (double)g_tb.numer;
+}
+
+static void dp_ref_refresh(void) {
+    /* Ask the controller for the current microframe and its host time. */
+    IOUSBHostTime t = 0;
+    NSError *e = nil;
+    uint64_t uf = [g_dev currentMicroframeWithTime:&t error:&e];
+    if (!uf || !t) return;
+    /* Publish the pair under the seqlock (odd while it is being written). */
+    uint32_t s = atomic_load_explicit(&g_dp_ref_seq, memory_order_relaxed);
+    atomic_store_explicit(&g_dp_ref_seq, s + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    g_dp_ref_uframe = uf; g_dp_ref_time = t;
+    atomic_store_explicit(&g_dp_ref_seq, s + 2, memory_order_release);
+    g_dp_last_refresh = mach_absolute_time();
+}
+
+/* The microframe reference, consistently. Bounded so the IO thread never spins on a preempted
+   writer: after 64 tries it uses the last copy any reader got (a plain static: see clk_get). */
+static _Atomic uint64_t g_dp_ref_last_uf, g_dp_ref_last_ut;
+static void dp_ref_get(uint64_t *uf, uint64_t *ut) {
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = atomic_load_explicit(&g_dp_ref_seq, memory_order_acquire);
+        uint64_t a = g_dp_ref_uframe, b = g_dp_ref_time;
+        atomic_thread_fence(memory_order_acquire);
+        uint32_t s2 = atomic_load_explicit(&g_dp_ref_seq, memory_order_relaxed);
+        if (!(s1 & 1) && s1 == s2) {
+            *uf = a; *ut = b;
+            atomic_store_explicit(&g_dp_ref_last_uf, a, memory_order_relaxed);
+            atomic_store_explicit(&g_dp_ref_last_ut, b, memory_order_relaxed);
+            return;
+        }
+    }
+    *uf = atomic_load_explicit(&g_dp_ref_last_uf, memory_order_relaxed);
+    *ut = atomic_load_explicit(&g_dp_ref_last_ut, memory_order_relaxed);
+}
+
+/* USB frame (1 ms, fractional) at host time t. Safe on any thread. */
+static double dp_frame_at(uint64_t t) {
+    uint64_t uf, ut;
+    dp_ref_get(&uf, &ut);
+    return ((double)uf + ((double)t - (double)ut) / (ticks_per_ms() / 8.0)) / 8.0;
+}
+
+/* Host time at which (fractional) USB frame usb_frame starts on the bus; the inverse of
+   dp_frame_at. A packet k of a frame starts k / 8 frames in (a microframe is 1/8 ms). */
+static uint64_t usb_frame_time(double usb_frame) {
+    uint64_t uf, ut;
+    dp_ref_get(&uf, &ut);
+    return (uint64_t)((double)ut + (8.0 * usb_frame - (double)uf) * (ticks_per_ms() / 8.0));
+}
+
+/* Frames in the next OUT packet: the box's measured rate, steered by dp_track_capture. */
+static int dp_packet_frames(void) {
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    double rate = (ticks_per_ms() / 8.0) / tpf;   /* frames per 125 us microframe */
+    /* Steer: remove the sent-vs-captured difference over DP_CORR_S (8000 microframes a second). */
+    rate -= g_dp_err / (8000.0 * DP_CORR_S);
+    /* Whole frames this packet, carrying the fraction to the next; within what a packet can hold. */
+    g_dp_acc += rate;
+    int n = (int)g_dp_acc;
+    g_dp_acc -= n;
+    if (n < 4) n = 4;
+    if (n > PKT_MAX / FRAME_BYTES) n = PKT_MAX / FRAME_BYTES;
+    return n;
+}
+
+/* (Re)start the schedule at frame F: it carries the timeline position DP_OUT_LATENCY_MS before
+   F's start time, and the sent-vs-captured count starts again from F. */
+static void dp_anchor(uint64_t F) {
+    double x0 = clk_sample_at(usb_frame_time((double)F)) - DP_OUT_LATENCY_MS * g_sr / 1000.0;
+    g_dp_next_frame = F;
+    g_dp_next_pos = x0 > 0 ? (uint64_t)x0 : 0;
+    g_dp_sent_cum = 0; g_dp_in_cum = 0; g_dp_err = 0; g_dp_acc = 0;
+    atomic_store(&g_dp_x0, g_dp_next_pos);
+    atomic_store(&g_dp_F0, F);
+}
+
+static bool dp_gone(IOReturn st) {
+    return st == kIOReturnNoDevice || st == kIOReturnNotAttached || st == kIOReturnNotResponding ||
+           st == kIOReturnOffline;
+}
+
+/* Queue `slot` for the next frame of the schedule, zero-filled, and publish where its samples go. */
+static void dp_submit(int slot, uint32_t gen) {
+    for (int attempt = 0; attempt < DP_TRIES; attempt++) {
+        if (!stream_live(gen) || !g_ppipe || !g_dp_ptr[slot]) return;
+
+        /* The current USB frame (refreshing the frame clock if its reference is over 0.5 ms old). */
+        if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
+        uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
+        if (g_dp_next_frame < now_f + DP_DRY_LEAD) {
+            /* The schedule has (almost) run dry: under DP_DRY_LEAD frames ahead of the bus, after
+               a completion stall of nearly DP_SLOTS ms (or repeated refusals). Re-anchor ahead. */
+            dp_anchor(now_f + DP_START_LEAD);
+            DBG_DO(dbg_dp_resync++);
+        }
+
+        /* Take the next frame of the schedule and its ring entry. */
+        uint64_t f = g_dp_next_frame++;
+        DPEntry *e = &g_dp_sched[f & (DP_SCHED_N - 1)];
+        /* unpublish while it is rewritten (seqlock writer) */
+        atomic_store_explicit(&e->frame, 0, memory_order_relaxed);
+        atomic_thread_fence(memory_order_release);
+
+        /* Size each packet from the predicted rate, recording where each packet's samples start. */
+        uint16_t off = 0;
+        for (int k = 0; k < PLAY_PKTS; k++) {
+            int n = dp_packet_frames();
+            e->off[k] = off;
+            g_dp_tx[slot][k] = (IOUSBHostIsochronousTransaction){
+                .requestCount = (uint32_t)(n * FRAME_BYTES), .offset = (uint32_t)(k * PKT_MAX) };
+            off += n;
+        }
+        /* The frame's first timeline position and its buffer, zeroed: silence until WriteMix writes. */
+        e->off[PLAY_PKTS] = off;
+        e->first = g_dp_next_pos;
+        e->buf = g_dp_ptr[slot];
+        memset(g_dp_ptr[slot], 0, PLAY_PKTS * PKT_MAX);
+
+        /* Queue it for frame f; its completion queues this slot again at the far end. */
+        NSError *err = nil;
+        BOOL ok = [g_ppipe enqueueIORequestWithData:g_dp_data[slot] transactionList:g_dp_tx[slot]
+                               transactionListCount:PLAY_PKTS firstFrameNumber:f
+                                            options:IOUSBHostIsochronousTransferOptionsNone error:&err
+                                  completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+            if (stream_live(gen) && st != kIOReturnAborted && !dp_gone(st)) dp_submit(slot, gen);
+        }];
+        if (ok) {
+            /* Queued: advance the positions and sent count, then publish the entry for WriteMix. */
+            g_dp_next_pos += off;
+            g_dp_sent_cum += off;
+            e->sent_cum = g_dp_sent_cum;
+            atomic_fetch_add_explicit(&g_total_play_frames, off, memory_order_relaxed);   /* status packet */
+            atomic_store_explicit(&e->frame, f, memory_order_release);   /* publish */
+            atomic_store_explicit(&g_dp_newest, f, memory_order_release);
+            return;
+        }
+        /* Refused: nothing is published, and the next frame carries these positions instead. */
+        DBG_DO(dbg_dp_enq_fail++);
+        DBG_LOG("DBG dp enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, err.localizedDescription);
+    }
+    /* Still refused: try this slot again shortly rather than losing it from the schedule. */
+    DBG_DO(dbg_dp_retry_later++);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ dp_submit(slot, gen); });
+}
+
+/* Allocate the transfer buffers (from the playback interface; dp_release frees them). */
+static bool dp_alloc(void) {
+    NSError *e = nil;
+    for (int i = 0; i < DP_SLOTS; i++) {
+        g_dp_data[i] = [g_play ioDataWithCapacity:PLAY_PKTS * PKT_MAX error:&e];
+        if (!g_dp_data[i]) { LOG("Deep-schedule playback: buffer allocation failed: %{public}@", e); return false; }
+        g_dp_ptr[i] = g_dp_data[i].mutableBytes;
+    }
+    for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
+    return true;
+}
+
+/* Start playback (from the capture handler, once capture has run a few ms): fill the schedule. */
+static void dp_start(uint32_t gen) {
+    if (!stream_live(gen)) return;
+    /* A fresh USB frame clock reference. */
+    dp_ref_refresh();
+#if SL3_DEBUG   /* check frameNumberWithTime: and the microframe reference agree */
+    IOUSBHostTime t = 0;
+    uint64_t fn = [g_dev frameNumberWithTime:&t];
+    DBG_LOG("DBG frameNumber %llu vs microframe estimate %.2f", fn, dp_frame_at(t));
+#endif
+    /* Anchor the schedule a few frames ahead of the bus, let WriteMix in, and queue every slot. */
+    dp_anchor((uint64_t)dp_frame_at(mach_absolute_time()) + DP_START_LEAD);
+    atomic_store_explicit(&g_dp_active, true, memory_order_release);
+    for (int i = 0; i < DP_SLOTS; i++) dp_submit(i, gen);
+    g_dp_started = true;
+    LOG("Deep-schedule playback started at frame %llu, %d x 1 ms queued, output latency %.1f + safety %.1f ms",
+        atomic_load(&g_dp_F0), DP_SLOTS, DP_OUT_LATENCY_MS, DP_OUT_SAFETY_MS);
+}
+
+/* A capture completion for USB frame fc placed `frames` frames: everything the box clocked since
+   the previous one, silence-filled frames included. Steer the predicted OUT sizes so that the frames sent through each USB frame
+   track the frames the box captured through it. */
+static void dp_track_capture(uint64_t fc, int frames) {
+    /* Count what the box captured since the schedule's anchor. */
+    if (!g_dp_started || fc < atomic_load(&g_dp_F0)) return;
+    g_dp_in_cum += frames;
+    /* Compare it with what was sent through the same frame; dp_packet_frames steers by the gap. */
+    DPEntry *e = &g_dp_sched[fc & (DP_SCHED_N - 1)];
+    if (atomic_load_explicit(&e->frame, memory_order_acquire) != fc) return;   /* not sent */
+    g_dp_err = (double)e->sent_cum - (double)g_dp_in_cum;
+#if SL3_DEBUG   /* the deep schedule's health, every ~2 s */
+    if (fabs(g_dp_err) > dbg_dp_err_max) dbg_dp_err_max = fabs(g_dp_err);
+    if (++dbg_dp_n % 2000 == 0)
+        DBG_LOG("DBG dp: sent-captured %.1f frames (max %.1f) | written %u, late %u, unscheduled %u | "
+            "enqueue refused %u, retried later %u, resyncs %u | WriteMix thread switches %u, concurrent %u, "
+            "rewritten samples %u | capture packet errors %u",
+            g_dp_err, dbg_dp_err_max, atomic_load(&dbg_dp_written), atomic_load(&dbg_dp_late),
+            atomic_load(&dbg_dp_unscheduled), dbg_dp_enq_fail, dbg_dp_retry_later, dbg_dp_resync,
+            atomic_load(&dbg_wm_thread_switches), atomic_load(&dbg_wm_concurrent), atomic_load(&dbg_wm_rewritten),
+            dbg_cap_pkt_err);
+    if (dbg_dp_n % 2000 == 0) dbg_er_log("so far");
+#endif
+}
+
+/* Read schedule entry for frame f consistently (seqlock reader). False if f is not published. */
+static bool dp_entry_get(uint64_t f, uint64_t *first, uint16_t off[PLAY_PKTS + 1], uint8_t **buf) {
+    DPEntry *c = &g_dp_sched[f & (DP_SCHED_N - 1)];
+    if (atomic_load_explicit(&c->frame, memory_order_acquire) != f) return false;
+    *first = c->first;
+    memcpy(off, c->off, sizeof c->off);
+    *buf = c->buf;
+    atomic_thread_fence(memory_order_acquire);
+    return atomic_load_explicit(&c->frame, memory_order_relaxed) == f;
+}
+
+/* WriteMix, on the HAL's IO thread: write the mix straight into the queued transfers. Lock-free;
+   no IOKit calls. Samples whose frame starts too soon, or is not queued, are dropped. */
+static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
+    /* Where to start looking: the newest published frame. It is at most DP_SLOTS frames from any
+       frame WriteMix can still write, so a nominal-rate estimate from it is off by well under a
+       frame whatever the box's clock error, on every IO thread (the HAL can run more than one, for
+       example when another app plays to the device). */
+    uint64_t hint_frame = atomic_load_explicit(&g_dp_newest, memory_order_acquire), hint_first = 0;
+    {
+        uint16_t o[PLAY_PKTS + 1]; uint8_t *b;
+        if (!hint_frame || !dp_entry_get(hint_frame, &hint_first, o, &b)) {
+            hint_frame = atomic_load(&g_dp_F0); hint_first = atomic_load(&g_dp_x0);
+        }
+    }
+    double now_f = dp_frame_at(mach_absolute_time());
+    double per_frame = g_sr / 1000.0;
+    UInt32 i = 0;
+    while (i < frames) {
+        /* Find the queued frame carrying position p: estimate from the hint, then step to it. */
+        uint64_t p = pos + i;
+        int64_t fg = (int64_t)hint_frame + (int64_t)floor(((double)p - (double)hint_first) / per_frame);
+        uint64_t first = 0;
+        uint16_t off[PLAY_PKTS + 1];
+        uint8_t *fbuf = NULL;
+        bool found = false;
+        for (int tries = 0; tries < 8 && fg > 0; tries++) {
+            if (!dp_entry_get((uint64_t)fg, &first, off, &fbuf)) break;
+            if (p < first) { fg--; continue; }
+            if (p >= first + off[PLAY_PKTS]) { fg++; continue; }
+            found = true;
+            break;
+        }
+        if (!found) {
+            /* Frame fg is not queued (refused, or beyond the schedule). Drop only up to the next
+               queued frame's samples; if none is near, drop the rest of this buffer. */
+            uint32_t skip = frames - i;
+            for (int64_t g = fg + 1; g > 0 && g <= fg + 4; g++) {
+                uint64_t f2; uint16_t o2[PLAY_PKTS + 1]; uint8_t *b2;
+                if (dp_entry_get((uint64_t)g, &f2, o2, &b2) && f2 > p) {
+                    if (f2 - p < skip) skip = (uint32_t)(f2 - p);
                     break;
                 }
-                rem -= pn;
             }
-            return;
+            DBG_DO(atomic_fetch_add_explicit(&dbg_dp_unscheduled, skip, memory_order_relaxed));
+            i += skip;
+            continue;
         }
-        if (s0 > s + 64) break;
+        /* The samples from p that this frame carries; the frame found is the next search's hint. */
+        hint_frame = (uint64_t)fg; hint_first = first;
+        uint32_t n = (uint32_t)(first + off[PLAY_PKTS] - p);
+        if (n > frames - i) n = frames - i;
+        /* Too close to its start: the controller may already be reading it, so drop them. */
+        if ((double)fg - now_f < DP_WRITE_GUARD_FRAMES) {
+            DBG_DO(atomic_fetch_add_explicit(&dbg_dp_late, n, memory_order_relaxed));
+        } else {
+            /* Otherwise write each sample into its packet: j is its offset in the frame, k its
+               packet. */
+            uint32_t j = (uint32_t)(p - first);
+            int k = 0;
+            for (uint32_t s = 0; s < n; s++, j++) {
+                while (k < PLAY_PKTS - 1 && j >= off[k + 1]) k++;
+                uint8_t *q = fbuf + k * PKT_MAX + (j - off[k]) * FRAME_BYTES;
+                const float *src = buf + (size_t)(i + s) * NCH;
+                /* Clip to [-1, 1] and convert to the box's packed 24-bit samples. */
+                for (int c = 0; c < NCH; c++) {
+                    float v = src[c];
+                    if (v > 1.0f) v = 1.0f;
+                    else if (v < -1.0f) v = -1.0f;
+                    int32_t raw = (int32_t)lrintf(v * 8388607.0f);
+                    q[c * 3]     = (uint8_t)raw;
+                    q[c * 3 + 1] = (uint8_t)(raw >> 8);
+                    q[c * 3 + 2] = (uint8_t)(raw >> 16);
+                }
+            }
+            DBG_DO(atomic_fetch_add_explicit(&dbg_dp_written, n, memory_order_relaxed));
+        }
+        i += n;
     }
 }
 
-/* ---- Output volume and mute (master + 6 channels, CoreAudio standard curve) ---- */
-#define VOL_MIN_DB  (-64.0f)
-#define VOL_MAX_DB  0.0f
-#define VOL_RAMP_MS 5.0f
-#define VOL_NCONTROLS (2 + NCH)
-static const AudioObjectID kControlObjs[VOL_NCONTROLS] = {
-    kObjVolume, kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4, kObjVolCh5, kObjVolCh6, kObjMute
-};
-static _Atomic float g_vol_db[1 + NCH] = { 0, 0, 0, 0, 0, 0, 0 };
-static _Atomic bool  g_vol_mute = false;
-static _Atomic float g_vol_gain[NCH]    = { 1, 1, 1, 1, 1, 1 };
-static _Atomic float g_vol_applied[NCH] = { 1, 1, 1, 1, 1, 1 };
-static pthread_mutex_t g_vol_mtx = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic float g_meter_peaks[2 * NCH];
+/* ============================================================================
+ * Level meters ('sl3m', for the control panel)
+ *
+ * The peak absolute sample level (0..1) on each input and output channel since the meters were last
+ * read: inputs as captured, outputs as sent to the box (after the volume). Each client process has
+ * its own set (up to METER_READERS), so two readers (the control panel and the meters tool, say) each
+ * see every peak. Reading the property returns the caller's peaks and starts its next ones. They are
+ * measured only while some client has read them in the last METER_IDLE_MS, so they cost nothing when
+ * no meter is shown.
+ * ============================================================================ */
+#define METER_IDLE_MS 1000
+#define METER_READERS 4
+typedef struct {
+    pid_t            pid;               /* the reader; set under g_meter_mtx */
+    _Atomic uint64_t last_read;         /* host time of its last read; 0 = slot free */
+    _Atomic float    peak[2 * NCH];     /* [0..NCH) inputs, [NCH..2*NCH) outputs */
+} MeterReader;
+static MeterReader g_meters[METER_READERS];
+static pthread_mutex_t g_meter_mtx = PTHREAD_MUTEX_INITIALIZER;   /* reads (property threads only) */
 
+static bool meter_slot_live(MeterReader *m, uint64_t now) {
+    uint64_t t = atomic_load_explicit(&m->last_read, memory_order_relaxed);
+    return t && (double)(now - t) < METER_IDLE_MS * ticks_per_ms();
+}
+
+static bool meter_active(void) {
+    uint64_t now = mach_absolute_time();
+    for (int r = 0; r < METER_READERS; r++) if (meter_slot_live(&g_meters[r], now)) return true;
+    return false;
+}
+
+/* Raise a peak to at least v (lock-free: its reader resets it concurrently). */
+static void meter_raise(_Atomic float *peak, float v) {
+    float cur = atomic_load_explicit(peak, memory_order_relaxed);
+    while (v > cur && !atomic_compare_exchange_weak_explicit(peak, &cur, v, memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+/* The peaks of `frames` interleaved frames, into every live reader's meters base..base+NCH-1. */
+static void meter_frames(int base, const float *buf, UInt32 frames) {
+    float pk[NCH] = { 0 };
+    for (UInt32 f = 0; f < frames; f++)
+        for (int c = 0; c < NCH; c++) pk[c] = fmaxf(pk[c], fabsf(buf[f * NCH + c]));
+    uint64_t now = mach_absolute_time();
+    for (int r = 0; r < METER_READERS; r++)
+        if (meter_slot_live(&g_meters[r], now))
+            for (int c = 0; c < NCH; c++) meter_raise(&g_meters[r].peak[base + c], pk[c]);
+}
+
+/* A reader's peaks since its last read, reset as they are taken. A new reader takes a free slot, or
+   the one read longest ago, and starts from silence. */
+static void meter_take(pid_t pid, Float32 out[2 * NCH]) {
+    pthread_mutex_lock(&g_meter_mtx);
+    MeterReader *m = NULL;
+    for (int r = 0; r < METER_READERS && !m; r++)
+        if (g_meters[r].pid == pid && atomic_load(&g_meters[r].last_read)) m = &g_meters[r];
+    if (!m) {
+        m = &g_meters[0];
+        for (int r = 1; r < METER_READERS; r++)
+            if (atomic_load(&g_meters[r].last_read) < atomic_load(&m->last_read)) m = &g_meters[r];
+        m->pid = pid;
+        for (int i = 0; i < 2 * NCH; i++) atomic_store(&m->peak[i], 0.0f);
+    }
+    for (int i = 0; i < 2 * NCH; i++) out[i] = atomic_exchange_explicit(&m->peak[i], 0.0f, memory_order_relaxed);
+    atomic_store_explicit(&m->last_read, mach_absolute_time(), memory_order_relaxed);
+    pthread_mutex_unlock(&g_meter_mtx);
+}
+
+/* ============================================================================
+ * Capture
+ *
+ * CAP_NXF 1 ms isochronous IN transfers are kept queued, each re-queued from its own completion
+ * for the next free USB frame (g_cap_frame). Every captured frame goes into g_in_ring at its
+ * timeline position, contiguously from the first (g_cap_base), and g_cap_head publishes how far
+ * that is, so ReadInput never hands the HAL a position capture has not written.
+ *
+ * The box clocks a frame of audio whether or not the host receives it. When the host doesn't (an
+ * errored packet, or USB frames with no capture request queued after a completion stall long
+ * enough for re-queued requests to be refused), the missing frames are filled with silence and
+ * counted as captured, so the ring, the clock tracker and the playback steering all keep counting
+ * what the box clocked, and the audio that follows lands at its own timeline position.
+ * ============================================================================ */
+static uint64_t g_cap_next_fc;          /* USB frame the next capture completion should cover (g_q) */
+static double   g_cap_fill_frac;        /* fraction of a frame carried between silence fills (g_q) */
+static _Atomic uint64_t g_cap_head;     /* timeline position just past the last frame written to the ring */
+#define CAP_VALID_SPAN (RING_FRAMES / 2)   /* ReadInput trusts positions this far behind the head */
+
+/* ----------------------------------------------------------------------------
+ * Early read
+ *
+ * A capture completion can be delivered up to ~8 ms after its frame, but the controller writes
+ * each packet straight into the transfer's buffer during the packet's own microframe. So ReadInput
+ * (the HAL's IO thread) reads packets out of the queued buffers itself, shortly after their
+ * microframe, and the input safety offset only has to cover that, not the completion delay.
+ *
+ * - How many frames a packet carried is only reported with its completion. So every buffer is
+ *   filled from a template (g_cap_fill) before it is queued, and the early reader counts how many
+ *   bytes at the end of a packet's slot still match it. In the template, each 24-bit sample slot
+ *   holds 0x7EPPPP or 0x81PPPP: the top byte alternates between the two ends of the range from one
+ *   channel to the next and from one frame to the next, and the low 16 bits are the sample's
+ *   position in the buffer, plus one. The top bytes stay one step in from full scale, so audio
+ *   clipped at 0x7FFFFF or 0x800000 doesn't match them. The SL 3's samples are packed, with no pad
+ *   byte that is always 0 (c.f. the SL 2), so the mark has to be something audio doesn't produce:
+ *   a whole frame matching it would need every channel at alternating near-full-scale values, at
+ *   the exact values for that position. Silence, ordinary audio, clipping and test tones don't.
+ * - The written part of a packet ends where the template stops matching. If that is on a frame
+ *   boundary, that is the frame count. If not (a frame caught part-written, or the last frame's last
+ *   bytes happen to match the template, which takes a channel-6 sample just short of full scale),
+ *   the packet is counted from the kernel's completeCount if the kernel has already filled it in,
+ *   and is otherwise left to the completion.
+ * - A packet is read only once its microframe has been over for CAP_SETTLE_UF microframes (one can
+ *   be caught part-written during its microframe), and not if the kernel has already marked it
+ *   errored in the transaction list.
+ * - The early reader starts where the completions have got to (g_cap_prog_*: the next USB frame to
+ *   complete, and the timeline position its first frame goes at), and walks forward packet by
+ *   packet, placing each frame at the position the completion will. It stops at the first packet
+ *   it can't read yet, a packet with no frames (missing or errored: the completion fills it with
+ *   silence), or a USB frame with no transfer queued.
+ * - The completion stays in charge. It writes every frame again (the same values), and keeps the
+ *   clock tracking, the playback steering, the meters and the silence fills. If it places frames
+ *   differently (an errored packet that still carried data), the early reader's position for the
+ *   next USB frame doesn't match the completion's, and it starts again from the completion's.
+ * - A buffer is tagged with its USB frame while queued (g_cap_tag), and 0 while it is refilled for
+ *   its next frame. The early reader checks the tag before and after reading a packet, converting
+ *   into a scratch buffer in between, so it never puts a refilled buffer's contents in the ring.
+ * ---------------------------------------------------------------------------- */
+#define CAP_SETTLE_UF  1           /* microframes after a packet's own before it is read early */
+#define CAP_MAP_N      128         /* USB frame -> transfer map entries: power of two, >= 2 x CAP_NXF */
+static uint8_t *g_cap_bytes[CAP_NXF];             /* the capture buffers' bytes, for the IO thread */
+static uint8_t  g_cap_fill[CAP_PKTS * PKT_MAX];   /* fills a capture buffer before it is queued: see above */
+static _Atomic uint64_t g_cap_tag[CAP_NXF];       /* USB frame the buffer holds, 0 while refilled */
+static _Atomic int      g_cap_idx_of[CAP_MAP_N];  /* the transfer queued for USB frame f, at [f % CAP_MAP_N] */
+/* The completions' progress (g_q writes, the IO thread reads; seqlock): the next USB frame to
+   complete and the timeline position of its first frame. fc 0 = no completion yet. */
+static _Atomic uint32_t g_cap_prog_seq;
+static uint64_t g_cap_prog_fc, g_cap_prog_pos;
+static _Atomic uint64_t g_cap_early_head;         /* timeline position just past the early reader's last frame */
+/* The early reader's own state: IO thread, one at a time (g_er_busy). */
+static _Atomic bool g_er_busy;
+static uint32_t g_er_gen;                         /* stream generation the state belongs to */
+static uint64_t g_er_fc, g_er_pos;                /* next packet to read: USB frame, packet, position */
+static int      g_er_k;
+static uint64_t g_er_at_fc[CAP_MAP_N], g_er_at_pos[CAP_MAP_N];   /* position at each USB frame's start */
+/* Whether the early read works on this connection. Each stream judges it once there is a second of
+   capture and ReadInput has asked for half a second of it (early_read_judge): it works if it placed
+   frames and the completions found few of the transfers it read from placed differently. (Counted by
+   transfer, not frame: an errored packet the early reader had placed shifts every frame after it, so
+   one packet can make hundreds of frames differ, but only the few transfers they lie in.) If it doesn't, the log and the
+   status say so, with the input dropouts. */
+enum { EARLY_UNKNOWN = 0, EARLY_WORKING = 1, EARLY_FAILED = 2 };
+static _Atomic uint32_t g_early_state;            /* this connection's latest judgement */
+static _Atomic uint64_t g_er_placed;              /* frames placed early in this stream */
+static uint64_t g_er_differ;                      /* g_q: of those, frames the completion found different */
+static uint64_t g_er_xfers, g_er_xfers_differ;    /* g_q: transfers holding early-placed frames, and those with any different */
+static _Atomic bool g_er_judged;                  /* this stream has been judged (set on g_q, read on the IO thread too):
+                                                     a release build stops counting for the judgement then */
+static _Atomic uint64_t g_rd_frames;              /* frames ReadInput asked for in this stream, after the first capture */
+static _Atomic uint64_t g_in_dropouts;            /* IO cycles in which some input frame wasn't captured in time
+                                                     (ReadInput returned silence), since the device was set up: the
+                                                     box connected, or the input safety offset changed (dropouts at
+                                                     another offset say nothing about this one) */
+#if SL3_DEBUG
+static _Atomic uint32_t dbg_er_restarts, dbg_er_refilled, dbg_er_cc_differs, dbg_er_errored;
+static _Atomic uint32_t dbg_er_by_kernel_count;   /* the template matched off a frame boundary: counted by completeCount */
+static _Atomic uint32_t dbg_er_left;              /* ... with no completeCount yet: left to the completion */
+static _Atomic uint64_t dbg_rd_early, dbg_rd_short;   /* ReadInput, after the first capture */
+static _Atomic int64_t  dbg_rd_margin_min;        /* frames between the read's end and the head, least */
+static void dbg_er_reset(void) {
+    dbg_er_restarts = dbg_er_refilled = dbg_er_cc_differs = dbg_er_errored = 0;
+    dbg_er_by_kernel_count = dbg_er_left = 0;
+    dbg_rd_early = dbg_rd_short = 0;
+    dbg_rd_margin_min = INT64_MAX;
+}
+static void dbg_er_log(const char *what) {
+    int64_t m = atomic_load(&dbg_rd_margin_min);
+    DBG_LOG("DBG early read %{public}s: frames placed early %llu, restarts %u, refilled while read %u, "
+        "errored %u, count differs %u, off-boundary by kernel count %u, off-boundary left %u | completion "
+        "found %llu different | ReadInput frames %llu: only there early %llu, "
+        "SILENCE (not captured yet) %llu | least margin %.2f ms",
+        what, atomic_load(&g_er_placed), atomic_load(&dbg_er_restarts), atomic_load(&dbg_er_refilled),
+        atomic_load(&dbg_er_errored), atomic_load(&dbg_er_cc_differs),
+        atomic_load(&dbg_er_by_kernel_count), atomic_load(&dbg_er_left), g_er_differ,
+        atomic_load(&g_rd_frames), atomic_load(&dbg_rd_early), atomic_load(&dbg_rd_short),
+        m == INT64_MAX ? 0.0 : 1000.0 * (double)m / g_sr);
+}
+#endif
+
+/* One captured frame: packed 24-bit little-endian samples; scale to float. */
+static inline void cap_frame_to_float(const uint8_t *q, float *fr) {
+    for (int c = 0; c < NCH; c++) {
+        uint32_t u = (uint32_t)q[c * 3] << 8 | (uint32_t)q[c * 3 + 1] << 16 | (uint32_t)q[c * 3 + 2] << 24;
+        fr[c] = (float)((int32_t)u >> 8) * (1.0f / 8388608.0f);
+    }
+}
+/* The same, from a buffer the controller may still be writing (the early reader). */
+static inline void cap_frame_to_float_live(const volatile uint8_t *q, float *fr) {
+    for (int c = 0; c < NCH; c++) {
+        uint32_t u = (uint32_t)q[c * 3] << 8 | (uint32_t)q[c * 3 + 1] << 16 | (uint32_t)q[c * 3 + 2] << 24;
+        fr[c] = (float)((int32_t)u >> 8) * (1.0f / 8388608.0f);
+    }
+}
+
+/* Build the capture fill template (see "Early read"): per 24-bit sample slot, little-endian, the
+   low 16 bits are its position in the buffer plus one, and the top byte is 0x7E or 0x81, alternating
+   by channel and by frame. */
+static void cap_fill_init(void) {
+    for (int s = 0; s < CAP_PKTS * PKT_MAX / SAMPLE_BYTES; s++) {
+        int frame = s / NCH, ch = s % NCH;
+        uint16_t pos = (uint16_t)(s + 1);
+        g_cap_fill[s * 3]     = (uint8_t)pos;
+        g_cap_fill[s * 3 + 1] = (uint8_t)(pos >> 8);
+        g_cap_fill[s * 3 + 2] = ((ch + frame) & 1) ? 0x81 : 0x7E;
+    }
+}
+
+/* How many bytes of a queued capture packet the controller has written: the slot's length less the
+   bytes at its end that still match the fill template (see "Early read"). */
+static inline int cap_written_bytes(const volatile uint8_t *p, const uint8_t *fill) {
+    int end = PKT_MAX;
+    while (end > 0 && p[end - 1] == fill[end - 1]) end--;
+    return end;
+}
+
+/* The completions' progress (g_q). */
+static void cap_prog_publish(uint64_t fc, uint64_t pos) {
+    uint32_t s = atomic_load_explicit(&g_cap_prog_seq, memory_order_relaxed);
+    atomic_store_explicit(&g_cap_prog_seq, s + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    g_cap_prog_fc = fc; g_cap_prog_pos = pos;
+    atomic_store_explicit(&g_cap_prog_seq, s + 2, memory_order_release);
+}
+/* ... read consistently (any thread). Bounded, as dp_ref_get: after 64 tries (a writer preempted
+   mid-publish) it uses the last copy any reader got, which is only a little behind. The early
+   reader carries on from there; the next completion's progress puts it right. */
+static _Atomic uint64_t g_cap_prog_last_fc, g_cap_prog_last_pos;
+static void cap_prog_get(uint64_t *fc, uint64_t *pos) {
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = atomic_load_explicit(&g_cap_prog_seq, memory_order_acquire);
+        uint64_t a = g_cap_prog_fc, b = g_cap_prog_pos;
+        atomic_thread_fence(memory_order_acquire);
+        uint32_t s2 = atomic_load_explicit(&g_cap_prog_seq, memory_order_relaxed);
+        if (!(s1 & 1) && s1 == s2) {
+            *fc = a; *pos = b;
+            atomic_store_explicit(&g_cap_prog_last_fc, a, memory_order_relaxed);
+            atomic_store_explicit(&g_cap_prog_last_pos, b, memory_order_relaxed);
+            return;
+        }
+    }
+    *fc = atomic_load_explicit(&g_cap_prog_last_fc, memory_order_relaxed);
+    *pos = atomic_load_explicit(&g_cap_prog_last_pos, memory_order_relaxed);
+}
+
+/* The completions' progress for the early reader; false before the stream's first completion. */
+static bool pfc_get(uint64_t *fc, uint64_t *pos) {
+    cap_prog_get(fc, pos);
+    return *fc != 0;
+}
+
+/* ReadInput (IO thread): place the packets that have arrived since the last completion (see "Early
+   read"). No locks, no allocation, no IOKit calls. */
+static void cap_read_early(void) {
+#if SL3_DEBUG
+    if (atomic_load_explicit(&dbg_no_early, memory_order_relaxed)) return;   /* test hook 0xF5 */
+#endif
+    if (atomic_exchange_explicit(&g_er_busy, true, memory_order_acquire)) return;   /* another IO thread is */
+    uint32_t gen = atomic_load_explicit(&g_stream_gen, memory_order_acquire);
+    uint64_t pfc, ppos;
+    if (!atomic_load_explicit(&g_io_running, memory_order_acquire) || !pfc_get(&pfc, &ppos)) goto out;
+
+    /* Carry on from where we got to, if that agrees with the completions; otherwise start again
+       from them (a new stream, the completions overtook us, or they placed frames differently). */
+    uint64_t at = pfc & (CAP_MAP_N - 1);
+    if (g_er_gen != gen || g_er_fc < pfc || g_er_at_fc[at] != pfc || g_er_at_pos[at] != ppos) {
+#if SL3_DEBUG
+        if (g_er_gen == gen && g_er_fc > pfc) atomic_fetch_add_explicit(&dbg_er_restarts, 1, memory_order_relaxed);
+#endif
+        g_er_gen = gen; g_er_fc = pfc; g_er_k = 0; g_er_pos = ppos;
+        g_er_at_fc[at] = pfc; g_er_at_pos[at] = ppos;
+    }
+
+    /* The USB frame clock, to tell which packets' microframes are over. */
+    uint64_t now = mach_absolute_time(), uf, ut;
+    dp_ref_get(&uf, &ut);
+    double tpu = ticks_per_ms() / 8.0;   /* host ticks per microframe */
+    float tmp[(PKT_MAX / FRAME_BYTES) * NCH];
+    for (int budget = CAP_NXF * CAP_PKTS; budget > 0; budget--) {
+        uint64_t f = g_er_fc;
+        int k = g_er_k;
+        /* Not until its microframe (8f + k) has been over for CAP_SETTLE_UF more. */
+        double ready = (double)ut + ((double)(8 * f + k + 1 + CAP_SETTLE_UF) - (double)uf) * tpu;
+        if ((double)now < ready) break;
+        /* The transfer queued for frame f, if one is. */
+        int idx = atomic_load_explicit(&g_cap_idx_of[f & (CAP_MAP_N - 1)], memory_order_relaxed);
+        if (idx < 0 || idx >= CAP_NXF || atomic_load_explicit(&g_cap_tag[idx], memory_order_acquire) != f) break;
+        /* Already reported errored by the kernel: leave it to the completion. */
+        const volatile IOUSBHostIsochronousTransaction *t = &g_cap_xf[idx].tx[k];
+        uint32_t cc = t->completeCount;
+        if (cc && (t->status != kIOReturnSuccess || cc > PKT_MAX)) {
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_errored, 1, memory_order_relaxed));
+            break;
+        }
+        /* Count the frames that arrived from where the fill template stops matching. Off a frame
+           boundary, take the kernel's count if it has one that covers the written bytes, or leave
+           the packet to the completion. None means missing or errored. The settle time
+           (CAP_SETTLE_UF) is what keeps the early reader clear of a packet still being written. */
+        const volatile uint8_t *p = g_cap_bytes[idx] + k * PKT_MAX;
+        int end = cap_written_bytes(p, g_cap_fill + k * PKT_MAX);
+        int n = end / FRAME_BYTES;
+        if (end % FRAME_BYTES) {
+            if (!cc || cc % FRAME_BYTES || (int)cc < end) {
+                DBG_DO(atomic_fetch_add_explicit(&dbg_er_left, 1, memory_order_relaxed));
+                break;
+            }
+            n = (int)(cc / FRAME_BYTES);
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_by_kernel_count, 1, memory_order_relaxed));
+        }
+        if (n == 0) break;
+        if (cc && (int)(cc / FRAME_BYTES) != n) {   /* the kernel's count disagrees: let the completion decide */
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_cc_differs, 1, memory_order_relaxed));
+            break;
+        }
+        for (int i = 0; i < n; i++) cap_frame_to_float_live(p + i * FRAME_BYTES, &tmp[i * NCH]);
+        /* Still frame f's buffer, not refilled while we read it? */
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&g_cap_tag[idx], memory_order_relaxed) != f) {
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_refilled, 1, memory_order_relaxed));
+            break;
+        }
+        /* Into the ring, where the completion will put them too. */
+        for (int i = 0; i < n; i++)
+            memcpy(&g_in_ring[((g_er_pos + i) & RING_MASK) * NCH], &tmp[i * NCH], NCH * sizeof(float));
+        g_er_pos += n;
+        atomic_fetch_add_explicit(&g_er_placed, n, memory_order_relaxed);
+        if (++g_er_k == CAP_PKTS) {
+            g_er_k = 0; g_er_fc++;
+            g_er_at_fc[g_er_fc & (CAP_MAP_N - 1)] = g_er_fc;
+            g_er_at_pos[g_er_fc & (CAP_MAP_N - 1)] = g_er_pos;
+        }
+    }
+    atomic_store_explicit(&g_cap_early_head, g_er_pos, memory_order_release);
+out:
+    atomic_store_explicit(&g_er_busy, false, memory_order_release);
+}
+
+/* Write n frames of silence into the ring from timeline position pos (at most the ring's size). */
+static void cap_fill_silence(uint64_t pos, uint64_t n) {
+    if (n > RING_FRAMES) { pos += n - RING_FRAMES; n = RING_FRAMES; }
+    for (uint64_t i = 0; i < n; i++)
+        memset(&g_in_ring[((pos + i) & RING_MASK) * NCH], 0, NCH * sizeof(float));
+}
+
+/* Audio frames the box clocks in `uframes` microframes (125 us each), at its measured rate. The
+   fraction of a frame left over is carried to the next call, so successive fills add up to the
+   box's real count (e.g. 5.51 frames per packet at 44.1 kHz). */
+static uint64_t cap_frames_in(uint64_t uframes) {
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    double f = (double)uframes * (ticks_per_ms() / 8.0) / tpf + g_cap_fill_frac;
+    uint64_t n = (uint64_t)f;
+    g_cap_fill_frac = f - (double)n;
+    return n;
+}
+
+/* Judge whether the early read works on this connection (g_q; see g_early_state), and if it doesn't,
+   say so, once per connection. */
+static void early_read_judge(void) {
+    atomic_store(&g_er_judged, true);
+    uint64_t placed = atomic_load(&g_er_placed);
+    bool works = placed > 0 && g_er_xfers > 0 && g_er_xfers_differ * 20 <= g_er_xfers;   /* under 5% */
+    uint32_t was = atomic_exchange(&g_early_state, works ? EARLY_WORKING : EARLY_FAILED);
+    if (!works && was != EARLY_FAILED)
+        LOG("Capture can't be read early on this connection (%llu frames placed early; %llu of %llu transfers "
+            "placed differently from their completion): input can drop out below an input safety offset of %d ms",
+            placed, g_er_xfers_differ, g_er_xfers, IN_SAFETY_SAFE_US / 1000);
+}
+
+static void cap_submit(int idx, uint32_t gen);
+
+/* A capture transfer for USB frame fc completed: put its frames in the ring, keep the clock and the
+   playback steering up to date, and queue the transfer again. */
+static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *done, uint32_t gen) {
+#if SL3_DEBUG
+    {   /* test hook 0xF3: hold g_q, as a stall in the USB stack's completion delivery would */
+        uint32_t ms = atomic_exchange(&dbg_stall_ms, 0);
+        if (ms) { DBG_LOG("DBG stalling the USB queue for %u ms", ms); usleep(ms * 1000); }
+    }
+#endif
+    /* Times below are bus times, from the USB frame clock (dp_ref_*): a completion's own
+       timeStamp is when the stack processed it, which can be many ms after the bus. */
+    if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
+#if SL3_DEBUG
+    {   /* when this handler runs, and the stack's completion stamp, relative to the bus
+           start of the transfer's frame (the transfer covers [0, 1) ms of it) */
+        double start = (double)usb_frame_time((double)fc);
+        double ms = ((double)mach_absolute_time() - start) / ticks_per_ms();
+        double stamp = done[CAP_PKTS - 1].timeStamp ? ((double)done[CAP_PKTS - 1].timeStamp - start) / ticks_per_ms() : 0;
+        int bin = (int)floor((ms + 2.0) / 0.5);
+        dbg_capdelay_hist[bin < 0 ? 0 : bin > 23 ? 23 : bin]++;
+        if (ms < dbg_capdelay_min) dbg_capdelay_min = ms;
+        if (ms > dbg_capdelay_max) dbg_capdelay_max = ms;
+        if (stamp < dbg_capstamp_min) dbg_capstamp_min = stamp;
+        if (stamp > dbg_capstamp_max) dbg_capstamp_max = stamp;
+    }
+#endif
+    uint64_t before = atomic_load_explicit(&g_total_cap_frames, memory_order_relaxed);   /* frames captured so far */
+
+    /* First capture of the stream: place this transfer's first good frame on the timeline (a
+       transfer with no good packet places nothing; the next one tries again). */
+    if (before == 0) {
+        int k = 0;
+        while (k < CAP_PKTS && !(done[k].status == kIOReturnSuccess && done[k].completeCount >= FRAME_BYTES &&
+                                 done[k].completeCount <= PKT_MAX)) k++;
+        if (k == CAP_PKTS) { cap_submit(idx, gen); return; }
+        clk_first_capture(usb_frame_time((double)fc + k / 8.0));
+        g_cap_next_fc = fc;
+    }
+    uint64_t ring_pos = g_cap_base + before;   /* timeline position of the next frame to write */
+    uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);   /* placed early below it */
+    bool xfer_early = false, xfer_differs = false;   /* this transfer held early-placed frames; any different */
+    bool check_early = SL3_DEBUG || !atomic_load(&g_er_judged);   /* the same-frame check, until judged */
+    uint64_t got = 0;                          /* frames placed by this completion, fill included */
+    uint64_t ts = 0;                           /* bus time of the first of them */
+
+    /* USB frames between the last completion and this one carried no capture request (they were
+       refused after a stall): the box clocked them anyway, so fill them with silence. */
+    if (before > 0 && fc > g_cap_next_fc) {
+        uint64_t missed = fc - g_cap_next_fc;
+        uint64_t n = cap_frames_in(8 * missed);
+        ts = usb_frame_time((double)g_cap_next_fc);
+        cap_fill_silence(ring_pos, n);
+        got += n;
+        LOG("Capture: %llu ms not captured (USB frames %llu-%llu), filled with silence",
+            missed, g_cap_next_fc, fc - 1);
+    }
+    g_cap_next_fc = fc + 1;
+
+    /* Each packet: convert its frames into the ring, or fill an errored one with silence. */
+    const uint8_t *b = g_cap_xf[idx].buf.bytes;
+    for (int k = 0; k < CAP_PKTS; k++) {
+        /* An errored packet, or an impossible length (a completion can report a completeCount far
+           above the packet size, e.g. 0xFFFFFE00): the frame loop must never run past the
+           126-byte packet, and the box clocked a packet's worth of frames regardless. */
+        bool bad = done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX;
+#if SL3_DEBUG
+        if (!bad && dbg_take_err_pkt()) bad = true;   /* test hook 0xF4 */
+#endif
+        if (!ts) ts = usb_frame_time((double)fc + k / 8.0);
+        if (bad) {
+            DBG_DO(dbg_cap_pkt_err++);
+            uint64_t n = cap_frames_in(1);
+            cap_fill_silence(ring_pos + got, n);
+            got += n;
+            continue;
+        }
+        /* A good packet: into the ring. */
+        int n = done[k].completeCount / FRAME_BYTES;
+        DBG_DO(dbg_cap_pkt_frames[n]++);
+        const uint8_t *p = b + k * PKT_MAX;
+        for (int s = 0; s < n; s++) {
+            float *fr = &g_in_ring[((ring_pos + got) & RING_MASK) * NCH];
+            /* A frame the early reader placed must be the same frame (early_read_judge counts those
+               that aren't). */
+            float was[NCH];
+            bool early = check_early && ring_pos + got < early_head;
+            if (early) memcpy(was, fr, sizeof was);
+            cap_frame_to_float(p + s * FRAME_BYTES, fr);
+            if (early) {
+                xfer_early = true;
+                if (memcmp(was, fr, sizeof was)) { g_er_differ++; xfer_differs = true; }
+            }
+            got++;
+        }
+    }
+    if (xfer_early) { g_er_xfers++; if (xfer_differs) g_er_xfers_differ++; }
+
+    /* The input meters, if shown: the frames just placed (the ring may wrap within them). After a
+       long gap the silence fill can be many times the ring, so take at most the newest ring's worth. */
+    if (meter_active()) {
+        uint64_t span = got < RING_FRAMES ? got : RING_FRAMES;
+        for (uint64_t left = span, at = (ring_pos + got - span) & RING_MASK; left > 0; ) {
+            uint64_t run = RING_FRAMES - at < left ? RING_FRAMES - at : left;
+            meter_frames(0, &g_in_ring[at * NCH], (UInt32)run);
+            left -= run; at = 0;
+        }
+    }
+
+    /* Publish the ring's new head for ReadInput, then keep the timeline on the box's clock. */
+    atomic_store_explicit(&g_cap_head, ring_pos + got, memory_order_release);
+    cap_prog_publish(g_cap_next_fc, ring_pos + got);   /* where the early reader starts from */
+    clk_track(before, (int)got, ts);
+
+    /* Playback: start after a few ms of capture, then steer it by what the box clocked. */
+    if (!g_dp_started && before >= (uint64_t)(8 * g_sr / 1000)) dp_start(gen);
+    dp_track_capture(fc, (int)got);
+
+    /* After a second of capture, with ReadInput reading it: does the early read work here? (An app
+       that only plays leaves ReadInput uncalled, and the early read unjudged.) */
+    if (!atomic_load(&g_er_judged) && before >= (uint64_t)g_sr && atomic_load(&g_rd_frames) >= (uint64_t)(g_sr / 2))
+        early_read_judge();
+    cap_submit(idx, gen);
+}
+
+/* Queue capture transfer idx for the next free USB frame. If the frame has already passed (after
+   a completion stall), re-anchor ahead of the bus; the frames skipped are filled with silence
+   when the next completion arrives. */
+static void cap_submit(int idx, uint32_t gen) {
+    for (int attempt = 0; attempt < DP_TRIES; attempt++) {
+        if (!stream_live(gen) || !g_cpipe) return;
+
+        /* The next free USB frame, unless that has already passed. */
+        if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
+        uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
+        if (g_cap_frame < now_f + DP_DRY_LEAD) g_cap_frame = now_f + DP_START_LEAD;
+        uint64_t f = g_cap_frame++;
+        g_cap_xf_frame[idx] = f;
+
+        /* Untag the buffer while it is refilled for frame f (see "Early read"), mark every frame
+           as not arrived, and ask for one full-size packet per microframe. */
+        atomic_store_explicit(&g_cap_tag[idx], 0, memory_order_relaxed);
+        atomic_thread_fence(memory_order_release);
+        memcpy(g_cap_bytes[idx], g_cap_fill, CAP_PKTS * PKT_MAX);
+        IOUSBHostIsochronousTransaction *tx = g_cap_xf[idx].tx;
+        for (int k = 0; k < CAP_PKTS; k++)
+            tx[k] = (IOUSBHostIsochronousTransaction){ .requestCount = PKT_MAX, .offset = (uint32_t)(k * PKT_MAX) };
+
+        /* Queue it for frame f; its completion hands the packets to cap_complete. */
+        NSError *e = nil;
+        BOOL ok = [g_cpipe enqueueIORequestWithData:g_cap_xf[idx].buf transactionList:tx
+                                transactionListCount:CAP_PKTS firstFrameNumber:f
+                                             options:IOUSBHostIsochronousTransferOptionsNone error:&e
+                                   completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+            if (!stream_live(gen) || st == kIOReturnAborted || dp_gone(st)) return;
+            cap_complete(idx, f, done, gen);
+        }];
+        if (ok) {
+            /* Queued: let the early reader find it (its completion, on this queue, can't run first). */
+            atomic_store_explicit(&g_cap_idx_of[f & (CAP_MAP_N - 1)], idx, memory_order_relaxed);
+            atomic_store_explicit(&g_cap_tag[idx], f, memory_order_release);
+            return;
+        }
+        /* Refused (the frame passed while this ran): take the next one. */
+        LOG("Capture enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, e.localizedDescription);
+        /* Never backwards: frames after f may already be queued on other transfers. */
+        uint64_t next = now_f + DP_START_LEAD + attempt + 1;
+        if (next > g_cap_frame) g_cap_frame = next;
+    }
+    /* Still refused: try again shortly rather than losing this transfer for the rest of the stream. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ cap_submit(idx, gen); });
+}
+
+/* ============================================================================
+ * USB Open / Close Lifecycle
+ * ============================================================================ */
+
+/* Whether a USB device service with the SL 3's IDs is running the box's firmware. The firmware
+   and a box with none (the EZ-USB's default device, after a failed or interrupted firmware update)
+   enumerate with the same vendor ID, product ID and bcdDevice (0x0000); only the firmware's
+   descriptors carry strings, so a box with a product string is running it. (A box with no firmware
+   is inferred from the EZ-USB's documented behaviour; not yet observed on an SL 3.) */
+static bool svc_has_firmware(io_service_t svc) {
+    CFTypeRef name = IORegistryEntryCreateCFProperty(svc, CFSTR("USB Product Name"), kCFAllocatorDefault, 0);
+    if (!name) return false;
+    CFRelease(name);
+    return true;
+}
+
+/* USB hubs between the box and the Mac: the USB devices among the box's ancestors (each hub is one;
+   the Mac's own ports belong to its controller). Reported in the status. */
+static _Atomic uint32_t g_hub_depth;
+static uint32_t usb_hub_depth(io_service_t svc) {
+    uint32_t hubs = 0;
+    io_registry_entry_t e = svc, parent;
+    IOObjectRetain(e);
+    for (int i = 0; i < 32 && IORegistryEntryGetParentEntry(e, kIOServicePlane, &parent) == KERN_SUCCESS; i++) {
+        IOObjectRelease(e);
+        e = parent;
+        if (IOObjectConformsTo(e, "IOUSBHostDevice")) hubs++;
+    }
+    IOObjectRelease(e);
+    return hubs;
+}
+
+/* The attached SL 3 running its firmware (the caller releases it), or IO_OBJECT_NULL. */
+static io_service_t find_sl3_service(void) {
+    /* Every USB device with the SL 3's vendor and product IDs. */
+    CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!m) return IO_OBJECT_NULL;
+    int v = VID, p = PID;
+    CFNumberRef vn = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    CFNumberRef pn = CFNumberCreate(NULL, kCFNumberIntType, &p);
+    CFDictionarySetValue(m, CFSTR(kUSBVendorID), vn);
+    CFDictionarySetValue(m, CFSTR(kUSBProductID), pn);
+    CFRelease(vn); CFRelease(pn);
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, m, &it) != KERN_SUCCESS) return IO_OBJECT_NULL;
+    io_service_t s, found = IO_OBJECT_NULL;
+    while ((s = IOIteratorNext(it))) {
+        /* Only the running firmware has the audio interfaces. A box with no firmware must stay
+           untouched so the firmware tools can reach it. */
+        if (!found && svc_has_firmware(s)) found = s;
+        else IOObjectRelease(s);
+    }
+    IOObjectRelease(it);
+    return found;
+}
+
+/* The USB queue (g_q): completions for the HID and audio interfaces. A plain high-priority serial
+   queue: its handlers can be delivered 5-30 ms late (the delay is in the USB stack, before any thread
+   is woken), so the streaming design does not depend on them being prompt; see
+   docs/SL3-AUDIO-ENGINE.md. */
+static dispatch_queue_t usb_queue_create(void) {
+    dispatch_queue_attr_t qa = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+    return dispatch_queue_create("com.rane.sl3.usb", qa);
+}
+
+/* Open the open device's interface with bInterfaceNumber ifnum, if it is there and nobody else holds
+   it; *there says whether it is there at all. If the open fails, *err gets why and *holder (if given)
+   the name of the client holding the interface (its UsbExclusiveOwner), or nil if nobody does. */
+static bool g_hid_reconfigured;   /* usb_ensure_hid has set the configuration again for this device */
+static IOUSBHostInterface *usb_open_interface(int ifnum, bool *there, NSString **holder, NSError **err) {
+    IOUSBHostInterface *found = nil;
+    *there = false;
+    if (holder) *holder = nil;
+    io_iterator_t it = 0;
+    IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
+    io_service_t ch;
+    while ((ch = IOIteratorNext(it))) {
+        CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
+        if (n) {
+            int idx = -1;
+            CFNumberGetValue(n, kCFNumberIntType, &idx);
+            CFRelease(n);
+            if (idx == ifnum && !*there) {
+                *there = true;
+                found = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone
+                                                                queue:g_q error:err interestHandler:nil];
+                if (!found && holder) {
+                    CFTypeRef o = IORegistryEntryCreateCFProperty(ch, CFSTR("UsbExclusiveOwner"), kCFAllocatorDefault, 0);
+                    if (o && CFGetTypeID(o) == CFStringGetTypeID()) *holder = (__bridge_transfer NSString *)o;
+                    else if (o) CFRelease(o);
+                }
+            }
+        }
+        IOObjectRelease(ch);
+    }
+    IOObjectRelease(it);
+    return found;
+}
+
+/* Open the box's HID side (device, HID interface, its two pipes), if not already open. The device
+   is opened once and kept: if its HID interface isn't registered yet (interfaces appear
+   asynchronously after the device is configured), a later call only looks for it again. */
+static bool usb_ensure_hid(void) {
+    if (g_dev && g_hid && g_hpipe_in && g_hpipe_out) return true;
+    NSError *e = nil;
+    /* The USB queue and hid_cmd's reply semaphore, created once and kept. */
+    if (!g_q) g_q = usb_queue_create();
+    if (!g_hid_sem) g_hid_sem = dispatch_semaphore_create(0);
+
+    /* The device: open it and select configuration 1, unless already done. */
+    if (!g_dev) {
+        io_service_t svc = find_sl3_service();
+        if (!svc) return false;
+        g_dev = [[IOUSBHostDevice alloc] initWithIOService:svc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
+        g_hid_reconfigured = false;
+        uint64_t rid = 0;
+        IORegistryEntryGetRegistryEntryID(svc, &rid);
+        atomic_store(&g_dev_regid, g_dev ? rid : 0);
+        uint32_t hubs = usb_hub_depth(svc);
+        atomic_store(&g_hub_depth, hubs);
+        if (hubs) LOG("Rane SL 3 is connected through %u USB hub%{public}s", hubs, hubs > 1 ? "s" : "");
+        IOObjectRelease(svc);
+        if (!g_dev) { LOG("Failed to open IOUSBHostDevice: %{public}@", e); return false; }
+    }
+    /* Configure it, unless already done, with its interfaces not offered to other drivers: the HID
+       interface is HID-class, so macOS's HID driver would take it otherwise, whenever it got there
+       before the driver (after a userspace reboot with the box attached, matching runs again before
+       coreaudiod is back). */
+    if (!g_dev.configurationDescriptor) [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
+
+    /* The HID interface. If another driver holds it (the box was configured with its interfaces
+       offered for matching, as when the box was configured by something else), set the configuration
+       again, once per device opened: that terminates the interfaces and their drivers, and the new
+       ones aren't offered to anyone. Only when someone does hold it: any other failure is logged. */
+    if (!g_hid) {
+        bool there = false;
+        NSString *holder = nil;
+        g_hid = usb_open_interface(IF_HID, &there, &holder, &e);
+        if (!g_hid && holder && !g_hid_reconfigured) {
+            g_hid_reconfigured = true;
+            LOG("The SL 3's HID interface is held by %{public}@ (%{public}@): setting the box's configuration again",
+                holder, e.localizedFailureReason ?: e.localizedDescription);
+            [g_dev configureWithValue:0 matchInterfaces:NO error:&e];
+            [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
+            g_hid = usb_open_interface(IF_HID, &there, &holder, &e);
+        }
+        if (!g_hid && there)
+            LOG("Could not open the SL 3's HID interface: %{public}@", e.localizedFailureReason ?: e.localizedDescription);
+        if (!g_hid) return false;
+    }
+
+    /* Its pipes; start reading the box's reports and replies, then read its status. */
+    g_hpipe_out = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e];
+    g_hpipe_in  = [g_hid copyPipeWithAddress:EP_HID_IN error:&e];
+    if (!g_hpipe_out || !g_hpipe_in) return false;
+    /* Clear both endpoints' halt, which resets their data toggles at both ends. Another host-side
+       client (macOS's HID driver, which may have held the interface) can leave the box's toggle at
+       DATA1 against a new pipe's DATA0: the box then takes every command for a repeat, acknowledges
+       and drops it, and never replies. */
+    [g_hpipe_out clearStallWithError:nil];
+    [g_hpipe_in clearStallWithError:nil];
+    g_hbuf_in   = [NSMutableData dataWithLength:64];
+    hid_read();
+    refresh_hw_status();
+    /* Connected. (Only a box with firmware is opened, find_sl3_service; refresh_hw_status has set
+       boot mode if that firmware is Rane's loader.) */
+    atomic_store(&g_hw_connected, true);
+    return true;
+}
+
+/* Switch the deep schedule off and wait for any WriteMix still writing into it, after which its
+   buffers can be released. */
+static void dp_stop(void) {
+    atomic_store_explicit(&g_dp_active, false, memory_order_seq_cst);
+    while (atomic_load_explicit(&g_dp_writers, memory_order_seq_cst) > 0) usleep(50);
+}
+
+/* Release the deep schedule's transfer buffers. They hold the playback interface open, so they
+   must go before the next stream claims it. Call on g_q, after the pipes are aborted. */
+static void dp_release(void) {
+    for (int i = 0; i < DP_SLOTS; i++) { g_dp_data[i] = nil; g_dp_ptr[i] = NULL; }
+    for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
+    atomic_store(&g_dp_newest, 0);
+}
+
+/* Undo whatever usb_open_all set up for the audio interfaces: abort the pipes, then release the
+   buffers and pipes on g_q, so no completion handler is still using them (one that runs later
+   sees the stream generation has moved on and does nothing), then put the interfaces back to
+   alternate setting 0 and destroy them so the next stream can claim them. Not called on g_q. */
+static void usb_release_audio(void) {
+    /* Abort the pipes: their queued transfers complete with kIOReturnAborted. */
+    if (g_cpipe) [g_cpipe abortWithError:nil];
+    if (g_ppipe) [g_ppipe abortWithError:nil];
+    /* Release buffers and pipes on g_q, behind any completion handler already queued there. Switch
+       the schedule off again first: a dp_start that passed its generation check before the stream
+       was stopped (it runs on g_q) can have let WriteMix back in after the caller's dp_stop. */
+    if (g_q) dispatch_sync(g_q, ^{
+        dp_stop();
+        dp_release();
+        g_cpipe = nil; g_ppipe = nil;
+    });
+    /* Put the interfaces back to alternate setting 0 and let them go for the next stream. */
+    if (g_cap)  { [g_cap selectAlternateSetting:0 error:nil];  [g_cap destroy];  g_cap = nil; }
+    if (g_play) { [g_play selectAlternateSetting:0 error:nil]; [g_play destroy]; g_play = nil; }
+}
+
+/* Start streaming: claim the audio interfaces, open their isochronous pipes, switch the decks to
+   USB audio and queue the capture transfers (playback starts from the capture handler). On any
+   failure, everything opened so far is released again. */
+static bool usb_open_all(void) {
+    if (!usb_ensure_hid()) return false;
+    /* Rane's firmware loader holds the DSP in reset: there is no audio to stream. */
+    if (atomic_load(&g_boot_mode)) {
+        LOG("Not streaming: the SL 3 is running Rane's firmware loader, not its firmware");
+        return false;
+    }
+    NSError *e = nil;
+
+    /* Playback stays off until the capture handler starts it; clear the debug counters. */
+    g_dp_started = false;
+    atomic_store(&g_dp_active, false);
+    DBG_DO(dbg_reset());
+
+    /* Claim the playback and capture interfaces. */
+    bool there = false;
+    if (!g_play) g_play = usb_open_interface(IF_PLAY, &there, NULL, &e);
+    if (!g_cap)  g_cap  = usb_open_interface(IF_CAP, &there, NULL, &e);
+    if (!g_play || !g_cap) {
+        LOG("Failed to claim Play/Cap interfaces: %{public}@", e.localizedFailureReason ?: e.localizedDescription);
+        usb_release_audio();
+        return false;
+    }
+
+    /* Set the box's rate, select the streaming alternate settings and open the pipes. */
+    send_hw_samplerate((int)g_sr);
+    [g_play selectAlternateSetting:1 error:&e];
+    g_ppipe = copy_isoch_pipe(g_play, kIOUSBEndpointDirectionOut, EP_PLAY, 0x02);
+    [g_cap selectAlternateSetting:1 error:&e];
+    g_cpipe = copy_isoch_pipe(g_cap, kIOUSBEndpointDirectionIn, EP_CAP, 0x86);
+    if (!g_ppipe || !g_cpipe) {
+        LOG("Failed to open Isoch pipes");
+        usb_release_audio();
+        return false;
+    }
+
+    /* Buffers: the playback schedule's (from the playback interface) and capture's. */
+    dp_ref_refresh();   /* USB frame clock, used for bus times from the first capture on */
+    if (!dp_alloc()) {
+        usb_release_audio();
+        return false;
+    }
+    cap_fill_init();
+    for (int i = 0; i < CAP_NXF; i++) {
+        if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
+        if (!g_cap_xf[i].tx)  g_cap_xf[i].tx  = calloc(CAP_PKTS, sizeof(IOUSBHostIsochronousTransaction));
+        g_cap_bytes[i] = g_cap_xf[i].buf.mutableBytes;
+        atomic_store(&g_cap_tag[i], 0);
+    }
+
+    /* Decks to USB audio, or as they were if this is the stream restarting after a replug. */
+    if (g_resume_pending) {
+        g_resume_pending = false;
+        set_sources(g_resume_source);
+        LOG("Stream restarted after the replug: decks routed as before it");
+    } else {
+        set_usb_switches(true);
+    }
+
+    /* A new timeline and an empty capture ring. */
+    memset(g_in_ring, 0, sizeof(g_in_ring));
+    atomic_store(&g_cap_head, 0);
+    atomic_store(&g_cap_early_head, 0);
+    atomic_store(&g_er_placed, 0);
+    atomic_store(&g_rd_frames, 0);
+    g_er_differ = 0;
+    g_er_xfers = g_er_xfers_differ = 0;
+    atomic_store(&g_er_judged, false);
+    cap_prog_publish(0, 0);
+    atomic_store(&g_cap_prog_last_fc, 0);
+    atomic_store(&g_cap_prog_last_pos, 0);
+    for (int i = 0; i < CAP_MAP_N; i++) atomic_store(&g_cap_idx_of[i], -1);
+    g_cap_next_fc = 0;
+    g_cap_fill_frac = 0;
+    clk_reset();
+    atomic_store(&g_total_cap_frames, 0);
+    atomic_store(&g_total_play_frames, 0);
+
+    /* A new stream generation, then queue the capture transfers, starting 32 frames (32 ms) ahead
+       of the bus. */
+    uint32_t gen = atomic_fetch_add(&g_stream_gen, 1) + 1;
+    atomic_store(&g_io_running, true);
+    g_cap_frame = [g_dev frameNumberWithTime:NULL] + 32;
+    for (int i = 0; i < CAP_NXF; i++) cap_submit(i, gen);
+
+    LOG("Streaming started on Rane SL 3 (%.0f Hz)", g_sr);
+    return true;
+}
+
+/* Stop streaming. box_attached false means the box is gone, so nothing is sent to it. */
+static void usb_stop_streaming(bool box_attached) {
+    dp_stop();   /* WriteMix stops touching the schedule */
+    /* Nothing more to do if no stream is running. */
+    if (!atomic_exchange(&g_io_running, false)) return;
+    atomic_fetch_add(&g_stream_gen, 1);   /* completions and retries of this stream now do nothing */
+#if SL3_DEBUG   /* this stream's results */
+    if (g_dp_started)
+        DBG_LOG("DBG dp result: written %u, late %u, unscheduled %u | enqueue refused %u, resyncs %u | "
+            "sent-captured now %.1f, max %.1f frames",
+            atomic_load(&dbg_dp_written), atomic_load(&dbg_dp_late), atomic_load(&dbg_dp_unscheduled),
+            dbg_dp_enq_fail, dbg_dp_resync, g_dp_err, dbg_dp_err_max);
+    {
+        const uint32_t *c = dbg_capdelay_hist;
+        char hb[600]; int o = 0;
+        for (int i = 0; i < 24; i++)
+            if (c[i]) o += snprintf(hb + o, sizeof hb - o, " %+.1f:%u", -2.0 + 0.5 * i, c[i]);
+        DBG_LOG("DBG capture handler vs bus start of its frame (ms, bin start:count):%{public}s | "
+            "min %.2f max %.2f | stack stamp min %.2f max %.2f",
+            hb, dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max);
+    }
+    dbg_er_log("result");
+    {
+        char pb[200]; int o = 0;
+        for (int i = 0; i <= PKT_MAX / FRAME_BYTES; i++)
+            if (dbg_cap_pkt_frames[i]) o += snprintf(pb + o, sizeof pb - o, " %d:%u", i, dbg_cap_pkt_frames[i]);
+        DBG_LOG("DBG capture packet sizes at %.0f Hz (frames:packets):%{public}s", g_sr, pb);
+    }
+#endif
+    /* Release the audio interfaces, then put the decks back on analogue thru if the box is here. */
+    usb_release_audio();
+    if (box_attached) {
+        set_usb_switches(false);
+        LOG("Streaming stopped; Analog Thru restored");
+    } else {
+        LOG("Streaming stopped (box disconnected)");
+    }
+}
+
+/* The box is gone: stop streaming, then release the HID side (on g_q, like the audio side). */
+static void usb_close_all(void) {
+    usb_stop_streaming(false);
+    /* Abort the HID pipes, so the pending read completes and is not queued again. */
+    if (g_hpipe_in)  [g_hpipe_in abortWithError:nil];
+    if (g_hpipe_out) [g_hpipe_out abortWithError:nil];
+    /* Release them on g_q, and not while hid_cmd is sending on the OUT pipe. */
+    if (g_q) dispatch_sync(g_q, ^{
+        pthread_mutex_lock(&g_hout_mtx);
+        g_hpipe_in = nil; g_hpipe_out = nil;
+        pthread_mutex_unlock(&g_hout_mtx);
+    });
+    /* Then the HID interface and the device itself; the next box is opened from scratch. */
+    if (g_hid)  { [g_hid destroy]; g_hid = nil; }
+    if (g_dev)  { [g_dev destroy]; g_dev = nil; }
+    atomic_store(&g_dev_regid, 0);
+    atomic_store(&g_bootstrap_open, false);
+    atomic_store(&g_hw_connected, false);
+}
+
+/* The device is published (in the plug-in's device list, so it shows in the system's device
+   lists) only while a box is attached. A box in its bootloader keeps it published so clients can
+   read boot_mode from the 'sl3s' status. */
+static _Atomic bool g_unlisted;   /* briefly out of the list, to be set up again (relist_device) */
+static bool device_published(void) {
+    if (atomic_load(&g_unlisted)) return false;
+    return atomic_load(&g_box_present) || atomic_load(&g_boot_mode);
+}
+
+/* Which boxes are attached now: running firmware and/or bootloader. */
+static void scan_attached(bool *audio, bool *bootloader) {
+    *audio = *bootloader = false;
+    /* Every USB device with the SL 3's vendor and product IDs. */
+    CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!m) return;
+    int v = VID, p = PID;
+    CFNumberRef vn = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    CFNumberRef pn = CFNumberCreate(NULL, kCFNumberIntType, &p);
+    CFDictionarySetValue(m, CFSTR(kUSBVendorID), vn);
+    CFDictionarySetValue(m, CFSTR(kUSBProductID), pn);
+    CFRelease(vn); CFRelease(pn);
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, m, &it) != KERN_SUCCESS) return;
+    /* Tell them apart by their descriptors' strings. */
+    io_service_t s;
+    while ((s = IOIteratorNext(it))) {
+        if (!svc_has_firmware(s)) *bootloader = true;
+        else                          *audio = true;
+        IOObjectRelease(s);
+    }
+    IOObjectRelease(it);
+}
+
+/* Tell the HAL the device list changed (the device appeared or went away), and that the device's
+   IsAlive did. */
+static void notify_device_list_changed(void) {
+    if (!g_host) return;
+    AudioObjectPropertyAddress plug[2] = {
+        { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+    };
+    AudioObjectPropertyAddress alive = {
+        kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    g_host->PropertiesChanged(g_host, kObjDevice, 1, &alive);
+    g_host->PropertiesChanged(g_host, kObjPlugIn, 2, plug);
+}
+
+/* ----------------------------------------------------------------------------
+ * Bootloader detection. The SL 3 keeps its firmware (the EZ-USB's code and the DSP's program) in
+ * an on-board I2C EEPROM. If the EEPROM is marked not bootable (a firmware update that didn't
+ * finish) the box enumerates as the EZ-USB's default device (same IDs, no strings, no HID
+ * interface) and passes no audio until the firmware is written again. The driver reports this — in
+ * the log and via a boot_mode flag in the 'sl3s' status — so a client knows the box needs its
+ * firmware restored (see svc_has_firmware).
+ * ---------------------------------------------------------------------------- */
+static void note_bootloader_device(void) {
+    LOG("Rane SL 3 has no firmware running (EZ-USB default device, no strings): no audio until the "
+        "box's firmware is restored.");
+}
+
+static dispatch_queue_t g_hotplug_q;
+
+/* Have the HAL set the device up again, so it reads a changed input safety offset (it reads safety
+   offsets only at device setup; a configuration change doesn't refresh them): take the device out of
+   the device list and put it back half a second later. Only with nothing streaming; on the hot-plug
+   queue. */
+static void relist_device(void) {
+    if (atomic_load(&g_io_running) || !device_published()) return;
+    if (atomic_exchange(&g_unlisted, true)) return;   /* already being set up again */
+    notify_device_list_changed();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), g_hotplug_q, ^{
+        in_safety_apply();
+        atomic_store(&g_in_dropouts, 0);
+        atomic_store(&g_unlisted, false);
+        notify_device_list_changed();
+        LOG("Device set up again: input safety offset %.1f ms", atomic_load(&g_in_safety_us) / 1000.0);
+    });
+}
+/* ... if the setting differs from the offset the device was set up with. */
+static void relist_if_safety_changed(void) {
+    if (!g_hotplug_q) return;
+    dispatch_async(g_hotplug_q, ^{
+        if (atomic_load(&g_in_safety_us) != atomic_load(&g_in_safety_set_us)) relist_device();
+    });
+}
+
+/* When the box's DSP has booted, its firmware puts every deck on USB audio (firmware 2.31; 2.50 does
+   so at power-up) and sets the rate back to 44.1 kHz. The DSP boots after the box is configured, and
+   again after a USB suspend and resume (the Mac sleeping), so it can finish after connect_box has set
+   thru and the rate. A while after connecting, and after the Mac wakes, the driver checks: with nothing
+   streaming, that each deck's output source is still the one the driver last knew (g_routing_known: what
+   it set, thru or the routing kept across a replug, or what a client set through it, so a deck put on
+   USB on purpose stays there); and that the box's rate is the driver's. Each correction is logged. */
+#define SETTLE_CHECK_MS 2000
+static void settle_check(const char *why) {
+    if (!atomic_load(&g_box_present)) return;   /* unplugged meanwhile */
+    pthread_mutex_lock(&g_mutex);
+    if (usb_ensure_hid() && !atomic_load(&g_boot_mode)) {
+        uint8_t r[HID_REPORT_LEN];
+        /* The routing: only with nothing streaming (a stream has the decks as its client sets them).
+           Put back a routing the box has lost, as the driver last knew it. */
+        if (!atomic_load(&g_io_running) && hid_cmd(SL3_CMD_GET_CONTROLS, NULL, 0, r, NULL)) {
+            note_controls(r + 5);
+            uint8_t known[SL3_NDECKS];
+            bool lost = false;
+            for (int d = 0; d < SL3_NDECKS; d++) {
+                known[d] = g_routing_known[d];
+                if ((r[5 + SL3_CTL_SOURCE_AT(d)] != 0) != (known[d] != 0)) lost = true;
+            }
+            if (lost) {
+                LOG("%{public}s: the box had lost the decks' routing: put back (Aux %{public}s, Left %{public}s, Right %{public}s)",
+                    why, known[0] ? "USB" : "thru", known[1] ? "USB" : "thru", known[2] ? "USB" : "thru");
+                set_sources(known);
+            }
+        }
+        /* The rate, streaming or not. */
+        if (hid_cmd(SL3_CMD_GET_RATE, NULL, 0, r, NULL)) {
+            int sr = (r[5] << 8) | r[6];
+            if (sr != (int)g_sr) {
+                LOG("%{public}s: the box was at %d Hz: set to %.0f Hz", why, sr, g_sr);
+                send_hw_samplerate((int)g_sr);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_mutex);
+}
+
+/* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
+   powers up with the Aux deck on USB audio, and every deck on USB audio when on external power), as
+   at stream stop, so turntables
+   reach the mixer until an app streams. The first open can be refused ("exclusive open of usb
+   object failed") while macOS is still setting the box up, about 1 connect in 30: retry for
+   about a second. */
+#define CONNECT_TRIES    10
+#define CONNECT_RETRY_MS 100
+static void connect_box(int attempt) {
+    if (!atomic_load(&g_box_present)) return;   /* unplugged meanwhile */
+    /* Open it; unless a stream is already running, set thru and the current rate. */
+    pthread_mutex_lock(&g_mutex);
+    bool ok = usb_ensure_hid();
+    /* (Not on Rane's firmware loader: it has no audio, and the firmware tools are using it.) */
+    bool resuming = false;
+    uint32_t window = 0;
+    if (g_resume_pending && (double)(mach_absolute_time() - g_resume_since) > RESUME_MAX_GAP_S * 1000.0 * ticks_per_ms())
+        g_resume_pending = false;   /* back long after the unplug: not the same session */
+    if (ok && !atomic_load(&g_io_running) && !atomic_load(&g_boot_mode)) {
+        set_idle_routing();   /* thru, or as before the unplug if a client was streaming */
+        resuming = g_resume_pending;
+        /* A fallback of its own: one left from an earlier replug (the box unplugged again before the
+           stream restarted) must not put the decks on thru early; on_usb_removed moves the window on too. */
+        if (resuming) window = ++g_resume_window;
+        send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
+    }
+    pthread_mutex_unlock(&g_mutex);
+    /* Expecting a client back: if no stream has started after RESUME_WAIT_MS, thru after all. */
+    if (resuming) {
+        LOG("Decks routed as before the unplug; waiting %d s for the stream to restart", RESUME_WAIT_MS / 1000);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, RESUME_WAIT_MS * NSEC_PER_MSEC), g_hotplug_q, ^{
+            pthread_mutex_lock(&g_mutex);
+            if (g_resume_pending && g_resume_window == window && !atomic_load(&g_io_running)) {
+                g_resume_pending = false;
+                if (atomic_load(&g_box_present) && usb_ensure_hid()) set_usb_switches(false);
+                LOG("No stream restarted within %d s of the replug: decks back on thru", RESUME_WAIT_MS / 1000);
+            }
+            pthread_mutex_unlock(&g_mutex);
+        });
+    }
+    if (ok) {
+        if (attempt > 0) LOG("Rane SL 3 opened on attempt %d", attempt + 1);
+        /* Check again once the DSP has surely booted (see settle_check). */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_CHECK_MS * NSEC_PER_MSEC), g_hotplug_q,
+                       ^{ settle_check("After connecting"); });
+        return;
+    }
+    /* Refused: try again on the hot-plug queue shortly, up to CONNECT_TRIES times in all. */
+    if (attempt + 1 < CONNECT_TRIES)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, CONNECT_RETRY_MS * NSEC_PER_MSEC), g_hotplug_q,
+                       ^{ connect_box(attempt + 1); });
+    else
+        LOG("Rane SL 3: could not open the box after %d attempts", CONNECT_TRIES);
+}
+
+/* Hot-plug: SL 3 USB devices appeared (on the hot-plug queue). */
+static void on_usb_added(void *refcon, io_iterator_t iter) {
+    /* Which kinds arrived: running firmware and/or bootloader (draining also re-arms the iterator). */
+    io_service_t s;
+    bool audio = false, bootloader = false;
+    while ((s = IOIteratorNext(iter))) {
+        if (!svc_has_firmware(s)) bootloader = true;
+        else                          audio = true;
+        IOObjectRelease(s);
+    }
+    if (!audio && !bootloader) return;
+    bool was_published = device_published();
+
+    /* A box with firmware: open it. */
+    if (audio) {
+        /* A new connection: its early read is judged afresh. */
+        atomic_store(&g_early_state, EARLY_UNKNOWN);
+        atomic_store(&g_in_dropouts, 0);
+        atomic_store(&g_boot_mode, false);
+        atomic_store(&g_box_present, true);
+        LOG("Rane SL 3 USB connected");
+        connect_box(0);
+    }
+    /* A box in its bootloader: only note it, so clients can see it needs its firmware. */
+    if (bootloader) {
+        atomic_store(&g_boot_mode, true);
+        note_bootloader_device();
+    }
+    /* The device has just appeared in the HAL's list: tell the HAL, which sets it up. */
+    if (!was_published) {
+        in_safety_apply();
+        notify_device_list_changed();
+    }
+}
+
+/* Hot-plug: SL 3 USB devices went away (on the hot-plug queue). */
+static void on_usb_removed(void *refcon, io_iterator_t iter) {
+    /* Drain the iterator (which re-arms it), noting whether the device the driver has open is
+       among the removed (by registry entry ID, which a terminated service still has); stop if
+       nothing was actually removed. */
+    io_service_t s;
+    bool removed = false, ours = false;
+    uint64_t open_id = atomic_load(&g_dev_regid);
+    while ((s = IOIteratorNext(iter))) {
+        uint64_t rid = 0;
+        if (open_id && IORegistryEntryGetRegistryEntryID(s, &rid) == KERN_SUCCESS && rid == open_id) ours = true;
+        IOObjectRelease(s);
+        removed = true;
+    }
+    if (!removed) return;
+    /* The removed service can no longer be asked what it was: see what is still attached. */
+    bool audio, bootloader;
+    scan_attached(&audio, &bootloader);
+    bool was_published = device_published();
+
+    /* The box with firmware is gone, or the device the driver has open is (a replug that arrived
+       before this ran leaves a new box attached): close everything that was open on it. */
+    if ((!audio || ours) && atomic_load(&g_box_present)) {
+        LOG("Rane SL 3 USB disconnected");
+        atomic_store(&g_box_present, false);
+        pthread_mutex_lock(&g_mutex);
+        /* A client streaming: remember the decks' routing, to restore after a replug (g_resume_pending). */
+        if (g_io_clients > 0 && atomic_load(&g_io_running)) {
+            ST_LOCK();
+            for (int d = 0; d < SL3_NDECKS; d++) g_resume_source[d] = g_st.thru[d] ? 0 : 1;
+            ST_UNLOCK();
+            g_resume_pending = true;
+            g_resume_since = mach_absolute_time();
+        }
+        /* Any fallback still waiting belongs to a replug that has just ended: the next replug restores
+           the routing and waits again. */
+        g_resume_window++;
+        usb_close_all();
+        /* The device leaves the HAL's list with the box, and a client using it again after a
+           replug sends a new StartIO: start counting clients from zero. */
+        if (g_io_clients) LOG("%u client(s) were streaming when the box was unplugged", g_io_clients);
+        g_io_clients = 0;
+        pthread_mutex_unlock(&g_mutex);
+        /* A box is attached again already: open it (its arrival may have been handled before this
+           removal, against the old device's handles). */
+        if (audio) {
+            atomic_store(&g_early_state, EARLY_UNKNOWN);
+            atomic_store(&g_in_dropouts, 0);
+            atomic_store(&g_box_present, true);
+            LOG("Rane SL 3 USB connected again before its removal was handled: opening the new one");
+            connect_box(0);
+        }
+    }
+    /* Boot mode follows what is still attached (a box with no firmware, or the open box running Rane's
+       loader); tell the HAL if the device left its list. */
+    atomic_store(&g_boot_mode, bootloader || (atomic_load(&g_box_present) && atomic_load(&g_bootstrap_open)));
+    if (was_published != device_published()) notify_device_list_changed();
+}
+
+/* System sleep and wake: after a wake the box's DSP boots again (see settle_check). Sleep itself is
+   always allowed. */
+static io_connect_t g_pm_root;
+static IONotificationPortRef g_pm_port;
+static io_object_t g_pm_notifier;
+static void on_power(void *refcon, io_service_t svc, natural_t msg, void *arg) {
+    switch (msg) {
+        case kIOMessageCanSystemSleep:
+        case kIOMessageSystemWillSleep:
+            IOAllowPowerChange(g_pm_root, (long)arg);
+            break;
+        case kIOMessageSystemHasPoweredOn:
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * SETTLE_CHECK_MS * NSEC_PER_MSEC), g_hotplug_q,
+                           ^{ settle_check("After the Mac woke"); });
+            break;
+    }
+}
+static void start_power_monitor(void) {
+    g_pm_root = IORegisterForSystemPower(NULL, &g_pm_port, on_power, &g_pm_notifier);
+    if (!g_pm_root) { LOG("System wake notifications could not be set up: thru and rate aren't checked after a wake"); return; }
+    IONotificationPortSetDispatchQueue(g_pm_port, g_hotplug_q);
+}
+
+/* Watch for the box being plugged in and unplugged, and handle one already attached. */
+static void start_hotplug_monitor(void) {
+    /* A serial queue for hot-plug work, and an IOKit notification port that delivers onto it. */
+    dispatch_queue_t hq = g_hotplug_q = dispatch_queue_create("com.rane.sl3.hotplug", DISPATCH_QUEUE_SERIAL);
+    g_notify_port = IONotificationPortCreate(kIOMainPortDefault);
+    IONotificationPortSetDispatchQueue(g_notify_port, hq);
+
+    /* The SL 3's vendor and product IDs, for the matching dictionaries below. */
+    int v = VID, p = PID;
+    CFNumberRef vn = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    CFNumberRef pn = CFNumberCreate(NULL, kCFNumberIntType, &p);
+
+    /* Notifications for the box arriving and leaving (both delivered on the hot-plug queue). */
+    CFMutableDictionaryRef m1 = IOServiceMatching(kIOUSBDeviceClassName);
+    CFDictionarySetValue(m1, CFSTR(kUSBVendorID), vn);
+    CFDictionarySetValue(m1, CFSTR(kUSBProductID), pn);
+    kern_return_t k1 = IOServiceAddMatchingNotification(g_notify_port, kIOFirstMatchNotification, m1, on_usb_added, NULL, &g_added_iter);
+    CFMutableDictionaryRef m2 = IOServiceMatching(kIOUSBDeviceClassName);
+    CFDictionarySetValue(m2, CFSTR(kUSBVendorID), vn);
+    CFDictionarySetValue(m2, CFSTR(kUSBProductID), pn);
+    kern_return_t k2 = IOServiceAddMatchingNotification(g_notify_port, kIOTerminatedNotification, m2, on_usb_removed, NULL, &g_removed_iter);
+    CFRelease(vn); CFRelease(pn);
+    if (k1 != KERN_SUCCESS || k2 != KERN_SUCCESS)
+        LOG("USB hot-plug notifications could not be set up (0x%x, 0x%x): plug and unplug won't be seen", k1, k2);
+
+    /* Each iterator must be drained once to arm it. Do that on the hot-plug queue too, so a box
+       already attached is handled there like any later arrival (not inside Initialize). */
+    dispatch_async(hq, ^{
+        on_usb_added(NULL, g_added_iter);
+        io_service_t o;
+        while ((o = IOIteratorNext(g_removed_iter))) IOObjectRelease(o);
+    });
+}
+
+/* ============================================================================
+ * CoreAudio AudioServerPlugIn Interface
+ * ============================================================================ */
+
+static HRESULT SL3_QueryInterface(void *inDriver, REFIID inUUID, LPVOID *outInterface) {
+    CFUUIDRef req = CFUUIDCreateFromUUIDBytes(NULL, inUUID);
+    CFUUIDRef iunk = IUnknownUUID;
+    CFUUIDRef p2 = kAudioServerPlugInDriverInterfaceUUID;
+    if (CFEqual(req, iunk) || CFEqual(req, p2)) {
+        CFRelease(req);
+        g_ref_count++;
+        *outInterface = inDriver;
+        return kAudioHardwareNoError;
+    }
+    CFRelease(req);
+    *outInterface = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG SL3_AddRef(void *inDriver) { return ++g_ref_count; }
+static ULONG SL3_Release(void *inDriver) { return g_ref_count > 0 ? --g_ref_count : 0; }
+
+static OSStatus SL3_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost) {
+    g_log = os_log_create("com.rane.sl3", "HAL");
+    g_host = inHost;
+    in_safety_load();
+    rate_load();
+    in_safety_apply();
+    mach_timebase_info(&g_tb);
+    clk_reset();
+    start_hotplug_monitor();
+    start_power_monitor();
+    LOG("SL3Device %{public}s (%{public}s) AudioServerPlugIn Initialized", SL3_VERSION, SL3_DEBUG ? "DEBUG" : "release");
+    return kAudioHardwareNoError;
+}
+
+static OSStatus SL3_CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc, const AudioServerPlugInClientInfo *ci, AudioObjectID *outID) { return kAudioHardwareUnsupportedOperationError; }
+static OSStatus SL3_DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID id) { return kAudioHardwareUnsupportedOperationError; }
+static OSStatus SL3_AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id, const AudioServerPlugInClientInfo *ci) { return kAudioHardwareNoError; }
+static OSStatus SL3_RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id, const AudioServerPlugInClientInfo *ci) { return kAudioHardwareNoError; }
+/* Sample-rate changes go through the HAL's configuration-change handshake: the setters call
+   RequestDeviceConfigurationChange with the new rate as the action, and the HAL calls this with
+   IO stopped, then re-reads the device's rate and formats. The HAL caches the rate, so a plug-in
+   must not change it any other way: the HAL would keep rendering at the cached rate into a box
+   clocked at the new one. */
+static OSStatus SL3_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) {
+    if (id != kObjDevice || (action != 44100 && action != 48000)) return kAudioHardwareBadObjectError;
+    pthread_mutex_lock(&g_mutex);
+    if ((Float64)action != g_sr) {
+        /* Stop any stream still running at the old rate. */
+        bool was_streaming = atomic_load(&g_io_running);
+        if (was_streaming) usb_stop_streaming(true);
+        /* Switch the rate and start a new timeline at it. */
+        g_sr = (Float64)action;
+        rate_save();
+        clk_reset();
+        atomic_fetch_add(&g_zts_seed, 1);   /* new timeline for the HAL */
+        /* Restart the stream at the new rate, or, with none running, just tell the box. */
+        if (was_streaming) {
+            if (!usb_open_all()) LOG("Could not restart streaming at %.0f Hz", g_sr);   /* sends 0x31 itself */
+        } else if (usb_ensure_hid()) {
+            send_hw_samplerate((int)g_sr);
+        }
+        LOG("Sample rate changed to %.0f Hz", g_sr);
+    }
+    pthread_mutex_unlock(&g_mutex);
+    return kAudioHardwareNoError;
+}
+
+/* Ask the HAL to switch the device to rate; it then stops IO and calls
+   SL3_PerformDeviceConfigurationChange. Re-selecting the current rate just re-sends it to the box. */
+static OSStatus request_sample_rate(Float64 rate) {
+    if (rate != 44100.0 && rate != 48000.0) return kAudioDeviceUnsupportedFormatError;
+    if (rate == g_sr) {
+        pthread_mutex_lock(&g_mutex);
+        if (usb_ensure_hid()) send_hw_samplerate((int)rate);
+        pthread_mutex_unlock(&g_mutex);
+        return kAudioHardwareNoError;
+    }
+    if (!g_host) return kAudioHardwareNotRunningError;
+    return g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)rate, NULL);
+}
+static OSStatus SL3_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) { return kAudioHardwareNoError; }
+
+/* ----------------------------------------------------------------------------
+ * Output volume and mute. The SL 3 has no known volume control of its own: Rane's software sets no
+ * level, and the control bytes the box passes to its DSP have no known level among them (bytes 4
+ * and 6 of each deck's block, 0-127, are unidentified). So the driver scales the samples itself: a
+ * master volume and mute (element 0, what the menu bar and the volume keys use) and a volume for
+ * each output channel (elements 1-6, shown per channel in Audio MIDI Setup).
+ * A channel's gain is the master's times its own. Without the master, the HAL's virtual main volume
+ * (the volume keys) would move only the preferred stereo pair, channels 1-2: the channels are
+ * discrete, not a speaker layout it could follow.
+ *
+ * The gain is applied in ProcessMix: the HAL calls it in place on the mix of all its clients, in the
+ * same IO cycle, just before WriteMix. Applying it there adds no buffering and moves no timing.
+ * Every client follows the volume, Serato included. The driver keeps the levels and mute only in
+ * memory, starting at 0 dB, unmuted; the HAL saves them per device and sets them again whenever the
+ * device is published (after a replug or a restart of coreaudiod), as it does for any device.
+ * ---------------------------------------------------------------------------- */
+#define VOL_MIN_DB      (-64.0f)   /* scalar 0 is silence (see vol_scalar_to_db for the curve) */
+#define VOL_MAX_DB      0.0f
+#define VOL_RAMP_MS     5.0f       /* a full-scale change of gain (0 to 1) takes this long */
+
+/* The volume controls' levels: [0] the master, [1..NCH] each channel. */
+static _Atomic float g_vol_db[1 + NCH] = { VOL_MAX_DB, VOL_MAX_DB, VOL_MAX_DB, VOL_MAX_DB, VOL_MAX_DB, VOL_MAX_DB, VOL_MAX_DB };
+static _Atomic bool  g_vol_mute = false;
+/* Each channel's linear gain from the levels and mute, and the gain the last ProcessMix ended at.
+   The HAL can call ProcessMix from more than one IO thread, but never two at once, so relaxed loads
+   and stores are enough. */
+static _Atomic float g_vol_gain[NCH]    = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+static _Atomic float g_vol_applied[NCH] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+
+/* Every control the device owns, in its ControlList order: the volumes (master, then each channel),
+   then the mute. kVolObjs is the volumes: the first 1 + NCH entries. */
+#define VOL_NCONTROLS   (2 + NCH)
+static const AudioObjectID kControlObjs[VOL_NCONTROLS] = { kObjVolume, kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4,
+                                                             kObjVolCh5, kObjVolCh6, kObjMute };
+#define kVolObjs kControlObjs
+/* Serialises volume and mute changes (on the HAL's property threads; never taken on the IO path), so
+   two changes at once can't leave the gains computed from a half-updated state. */
+static pthread_mutex_t g_vol_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Which level a volume control sets (0 = master, 1..NCH = channel), or -1 if oid is not one. */
 static int vol_index(AudioObjectID oid) {
-    for (int i = 0; i <= NCH; i++) if (kControlObjs[i] == oid) return i;
+    for (int i = 0; i <= NCH; i++) if (kVolObjs[i] == oid) return i;
     return -1;
 }
 static bool vol_is_control(AudioObjectID oid) { return oid == kObjMute || vol_index(oid) >= 0; }
+
+/* Slider position (the scalar, 0..1) and level, by CoreAudio's standard volume curve (its "2 over 1"
+   transfer function): the scalar is the square of the level's position in the dB range. The Mac's
+   built-in output and Apple-driven USB interfaces follow it, so the slider and the volume keys feel
+   the same here as there: half-way is about -19 dB, not half the dB range. */
 static float vol_scalar_to_db(float s) {
     if (!isfinite(s) || s < 0) s = 0; else if (s > 1) s = 1;
     return VOL_MIN_DB + sqrtf(s) * (VOL_MAX_DB - VOL_MIN_DB);
@@ -285,1144 +2553,1013 @@ static float vol_db_to_scalar(float db) {
     float x = (db - VOL_MIN_DB) / (VOL_MAX_DB - VOL_MIN_DB);
     return x * x;
 }
+/* A level's linear gain; the bottom of the range is silence. */
 static float vol_db_to_gain(float db) { return db <= VOL_MIN_DB ? 0.0f : powf(10.0f, db / 20.0f); }
+
+/* Recompute each channel's gain after a change of level or mute. */
 static void vol_update_gain(void) {
     float master = atomic_load(&g_vol_mute) ? 0.0f : vol_db_to_gain(atomic_load(&g_vol_db[0]));
     for (int ch = 0; ch < NCH; ch++)
         atomic_store(&g_vol_gain[ch], master * vol_db_to_gain(atomic_load(&g_vol_db[1 + ch])));
 }
+
+/* Tell the HAL's clients that a volume control's value (both its scalar and dB forms) or the mute
+   control's value changed. */
+static void vol_notify(AudioObjectID oid) {
+    if (!g_host) return;
+    if (oid == kObjMute) {
+        AudioObjectPropertyAddress mute = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        g_host->PropertiesChanged(g_host, kObjMute, 1, &mute);
+    } else {
+        AudioObjectPropertyAddress vol[2] = {
+            { kAudioLevelControlPropertyScalarValue,  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+            { kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        };
+        g_host->PropertiesChanged(g_host, oid, 2, vol);
+    }
+}
+
+/* ProcessMix, on the IO thread: scale each channel of the mix by its gain. A channel at unity gain
+   is not touched. A change of gain ramps at a fixed rate (VOL_RAMP_MS for the full range), carrying
+   on into the next cycles if need be, so a step doesn't click whatever the IO buffer size. */
+static void vol_process_mix(float *buf, UInt32 frames) {
+    /* Each channel's target and current gain; nothing to do if every channel is steady at unity. */
+    float target[NCH], g[NCH];
+    bool unity = true, ramping = false;
+    for (int ch = 0; ch < NCH; ch++) {
+        target[ch] = atomic_load_explicit(&g_vol_gain[ch], memory_order_relaxed);
+        g[ch] = atomic_load_explicit(&g_vol_applied[ch], memory_order_relaxed);
+        if (g[ch] != target[ch]) ramping = true;
+        if (g[ch] != 1.0f || target[ch] != 1.0f) unity = false;
+    }
+    if (unity) return;
+
+    /* Steady: one gain per channel, in a single pass. */
+    if (!ramping) {
+        for (UInt32 f = 0; f < frames; f++)
+            for (int ch = 0; ch < NCH; ch++) buf[f * NCH + ch] *= target[ch];
+        return;
+    }
+    /* Ramping: each channel moves towards its target by at most one step per frame. */
+    float step = 1000.0f / (VOL_RAMP_MS * (float)g_sr);
+    for (UInt32 f = 0; f < frames; f++)
+        for (int ch = 0; ch < NCH; ch++) {
+            g[ch] = g[ch] < target[ch] ? fminf(g[ch] + step, target[ch]) : fmaxf(g[ch] - step, target[ch]);
+            buf[f * NCH + ch] *= g[ch];
+        }
+    for (int ch = 0; ch < NCH; ch++) atomic_store_explicit(&g_vol_applied[ch], g[ch], memory_order_relaxed);
+}
+
+/* A new stream starts at the current gains rather than ramping from where the last one ended. */
 static void vol_snap(void) {
     for (int ch = 0; ch < NCH; ch++) atomic_store(&g_vol_applied[ch], atomic_load(&g_vol_gain[ch]));
 }
-static void vol_apply_frame(float *fr) {
-    float step = 1000.0f / (VOL_RAMP_MS * (float)RATE);
-    for (int ch = 0; ch < NCH; ch++) {
-        float target = atomic_load_explicit(&g_vol_gain[ch], memory_order_relaxed);
-        float g = atomic_load_explicit(&g_vol_applied[ch], memory_order_relaxed);
-        if (g != target) {
-            g = g < target ? fminf(g + step, target) : fmaxf(g - step, target);
-            atomic_store_explicit(&g_vol_applied[ch], g, memory_order_relaxed);
+
+/* The volume and mute controls' properties. */
+static UInt32 vol_property_size(AudioObjectID oid, AudioObjectPropertySelector s) {
+    switch (s) {
+        case kAudioObjectPropertyBaseClass:
+        case kAudioObjectPropertyClass:              return sizeof(AudioClassID);
+        case kAudioObjectPropertyOwner:              return sizeof(AudioObjectID);
+        case kAudioObjectPropertyOwnedObjects:       return 0;
+        case kAudioObjectPropertyName:               return sizeof(CFStringRef);
+        case kAudioControlPropertyScope:             return sizeof(AudioObjectPropertyScope);
+        case kAudioControlPropertyElement:           return sizeof(AudioObjectPropertyElement);
+    }
+    if (vol_index(oid) >= 0) switch (s) {
+        case kAudioLevelControlPropertyScalarValue:
+        case kAudioLevelControlPropertyDecibelValue:
+        case kAudioLevelControlPropertyConvertScalarToDecibels:
+        case kAudioLevelControlPropertyConvertDecibelsToScalar: return sizeof(Float32);
+        case kAudioLevelControlPropertyDecibelRange:            return sizeof(AudioValueRange);
+    }
+    if (oid == kObjMute && s == kAudioBooleanControlPropertyValue) return sizeof(UInt32);
+    return UINT32_MAX;   /* not a property of this control */
+}
+
+static bool vol_has_property(AudioObjectID oid, AudioObjectPropertySelector s) {
+    return vol_property_size(oid, s) != UINT32_MAX;
+}
+
+static bool vol_property_settable(AudioObjectID oid, AudioObjectPropertySelector s) {
+    return (vol_index(oid) >= 0 && (s == kAudioLevelControlPropertyScalarValue || s == kAudioLevelControlPropertyDecibelValue)) ||
+           (oid == kObjMute && s == kAudioBooleanControlPropertyValue);
+}
+
+static OSStatus vol_get_property(AudioObjectID oid, AudioObjectPropertySelector s, UInt32 inSize, UInt32 *outSize, void *outData) {
+    static CFStringRef const names[1 + NCH] = {
+        CFSTR("Output Volume"), CFSTR("Aux Out L"), CFSTR("Aux Out R"),
+        CFSTR("Left Deck Out L"), CFSTR("Left Deck Out R"),
+        CFSTR("Right Deck Out L"), CFSTR("Right Deck Out R")
+    };
+    UInt32 need = vol_property_size(oid, s);
+    if (need == UINT32_MAX) return kAudioHardwareUnknownPropertyError;
+    if (inSize < need) return kAudioHardwareBadPropertySizeError;
+    *outSize = need;
+    int v = vol_index(oid);   /* -1 for the mute control */
+    switch (s) {
+        case kAudioObjectPropertyBaseClass:
+            *(AudioClassID*)outData = v >= 0 ? kAudioLevelControlClassID : kAudioBooleanControlClassID; return 0;
+        case kAudioObjectPropertyClass:
+            *(AudioClassID*)outData = v >= 0 ? kAudioVolumeControlClassID : kAudioMuteControlClassID; return 0;
+        case kAudioObjectPropertyOwner: *(AudioObjectID*)outData = kObjDevice; return 0;
+        case kAudioObjectPropertyOwnedObjects: return 0;
+        case kAudioObjectPropertyName: *(CFStringRef*)outData = v >= 0 ? names[v] : CFSTR("Output Mute"); return 0;
+        case kAudioControlPropertyScope: *(AudioObjectPropertyScope*)outData = kAudioObjectPropertyScopeOutput; return 0;
+        case kAudioControlPropertyElement: *(AudioObjectPropertyElement*)outData = v > 0 ? (UInt32)v : kAudioObjectPropertyElementMain; return 0;
+        case kAudioLevelControlPropertyScalarValue: *(Float32*)outData = vol_db_to_scalar(atomic_load(&g_vol_db[v])); return 0;
+        case kAudioLevelControlPropertyDecibelValue: *(Float32*)outData = atomic_load(&g_vol_db[v]); return 0;
+        case kAudioLevelControlPropertyDecibelRange: {
+            AudioValueRange *r = (AudioValueRange*)outData;
+            r->mMinimum = VOL_MIN_DB; r->mMaximum = VOL_MAX_DB;
+            return 0;
         }
-        fr[ch] *= g;
+        /* The conversions take their input in the output buffer. */
+        case kAudioLevelControlPropertyConvertScalarToDecibels: *(Float32*)outData = vol_scalar_to_db(*(Float32*)outData); return 0;
+        case kAudioLevelControlPropertyConvertDecibelsToScalar: *(Float32*)outData = vol_db_to_scalar(*(Float32*)outData); return 0;
+        case kAudioBooleanControlPropertyValue: *(UInt32*)outData = atomic_load(&g_vol_mute) ? 1 : 0; return 0;
     }
-}
-static void meter_update(int base, const float *fr) {
-    for (int c = 0; c < NCH; c++) {
-        float a = fabsf(fr[c]);
-        float prev = atomic_load_explicit(&g_meter_peaks[base + c], memory_order_relaxed);
-        if (a > prev) atomic_store_explicit(&g_meter_peaks[base + c], a, memory_order_relaxed);
-    }
+    return kAudioHardwareUnknownPropertyError;
 }
 
-typedef struct {
-    uint32_t present;
-    uint32_t is_c0;
-    uint32_t buffer_ms;
-    uint32_t phono_seq;
-    uint32_t thru_seq;
-    uint32_t ovl_seq;
-    uint8_t  phono[4];
-    uint8_t  thru[4];
-    uint8_t  ovl[8];
-} sl3_hal_status_t;
-
-static sl3_hal_status_t g_st = { .buffer_ms = 5 };
-static pthread_mutex_t g_hid_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_hout_lock = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic int g_hid_stop;
-static _Atomic uint64_t g_last_client_hb;
-static dispatch_semaphore_t g_wait_sem;
-static _Atomic uint8_t g_wait_cmd;
-static _Atomic uint32_t g_wait_seq;
-static uint8_t g_wait_reply[HID_REPORT];
-static _Atomic int g_wait_done = 1;
-
-static dispatch_queue_t g_q;
-static IOUSBHostInterface *g_cap, *g_play, *g_hid;
-static IOUSBHostPipe *g_cpipe, *g_ppipe, *g_hout, *g_hin;
-static NSMutableData *g_cbuf[CAP_NXF], *g_pbuf[PLAY_NXF], *g_req_out, *g_req_in, *g_hb_out, *g_hb_in;
-static IOUSBHostIsochronousTransaction g_ctl[CAP_NXF][CAP_PKTS], g_ptl[PLAY_NXF][PLAY_PKTS];
-static uint64_t g_cframe, g_pframe;
-static _Atomic int g_inflight, g_hb_inflight, g_stop;
-static uint64_t g_cap_s, g_play_s;      /* next capture / playback sample time */
-static int g_play_resync;
-#define FIFO_N 4096
-static int g_fifo[FIFO_N];
-static unsigned g_fifo_w, g_fifo_r;
-static double g_acc;
-static _Atomic uint32_t g_hid_seq = 1;
-static uint32_t g_hb_seq;
-static int g_hb_busy;
-static dispatch_source_t g_hb_timer;
-static float g_pk_in[NCH], g_pk_hal[NCH], g_pk_usb[NCH];   /* input/output peaks */
-static uint64_t g_in_next, g_out_next;   /* expected next HAL sample times */
-static dispatch_source_t g_stat_timer;
-
-static void make_realtime(void) {
-    static __thread int done;
-    if (done) return;
-    done = 1;
-    double ms = 1e6 / g_tick_ns;
-    thread_time_constraint_policy_data_t p = { (uint32_t)(1 * ms), (uint32_t)(0.3 * ms), (uint32_t)(1 * ms), 1 };
-    thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
-                      (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-}
-
-static io_service_t usb_find(const char *cls, int ifnum) {
-    CFMutableDictionaryRef m = IOServiceMatching(cls);
-    NSMutableDictionary *p = [@{@"idVendor": @VID, @"idProduct": @PID} mutableCopy];
-    if (ifnum >= 0) p[@"bInterfaceNumber"] = @(ifnum);
-    CFDictionarySetValue(m, CFSTR(kIOPropertyMatchKey), (__bridge CFDictionaryRef)p);
-    return IOServiceGetMatchingService(kIOMainPortDefault, m);
-}
-static _Atomic int g_present;   /* SL3 attached, from IOKit notifications */
-/* Device listed and alive: while the SL3 is attached, and also while IO runs
- * without it, so clients keep the same device and resume after a replug. */
-static _Atomic int g_visible;
-static int usb_present(void) { io_service_t s = usb_find("IOUSBHostDevice", -1); if (s) IOObjectRelease(s); return s != 0; }
-
-static IOUSBHostInterface *usb_open(int ifnum) {
-    io_service_t s = usb_find("IOUSBHostInterface", ifnum);
-    if (!s) return nil;
-    NSError *e = nil;
-    IOUSBHostInterface *i = [[IOUSBHostInterface alloc] initWithIOService:s options:IOUSBHostObjectInitOptionsNone
-                                                                    queue:g_q error:&e interestHandler:nil];
-    IOObjectRelease(s);
-    if (!i) os_log_error(g_log, "open interface %d failed: %{public}@", ifnum, e.localizedDescription);
-    return i;
-}
-
-static int usb_fatal(IOReturn st) {
-    return st == kIOReturnAborted || st == kIOReturnNoDevice || st == kIOReturnNotAttached || st == kIOReturnOffline;
-}
-
-/* Host tick at which USB frame f starts, from the interface's current frame. */
-static double usb_frame_host(IOUSBHostInterface *intf, uint64_t f) {
-    uint64_t t = 0;
-    uint64_t cur = [intf frameNumberWithTime:(IOUSBHostTime *)&t];
-    return (double)t + ((double)f - (double)cur) * 1e6 / g_tick_ns;
-}
-
-static BOOL usb_enqueue(IOUSBHostPipe *pipe, IOUSBHostInterface *intf, NSMutableData *d, IOUSBHostIsochronousTransaction *tl,
-                        int n, uint64_t *frame, IOUSBHostIsochronousTransactionCompletionHandler h) {
-    for (int attempt = 0; attempt < 2; attempt++) {
-        NSError *e = nil;
-        if ([pipe enqueueIORequestWithData:d transactionList:tl transactionListCount:n firstFrameNumber:*frame
-                                   options:IOUSBHostIsochronousTransferOptionsNone error:&e completionHandler:h]) {
-            *frame += n / 8;
-            return YES;
-        }
-        S.xfer_err++;
-        uint64_t now = [intf frameNumberWithTime:NULL];
-        os_log_error(g_log, "%{public}s enqueue for frame %llu failed (now %llu): %{public}@", pipe == g_cpipe ? "capture" : "playback",
-                     *frame, now, e.localizedDescription);
-        *frame = now + 2;
-        if (pipe == g_ppipe) g_play_resync = 1;
-    }
-    return NO;
-}
-
-static void cap_submit(int i) {
-    IOUSBHostIsochronousTransaction *tl = g_ctl[i];
-    for (int k = 0; k < CAP_PKTS; k++) tl[k] = (IOUSBHostIsochronousTransaction){ .requestCount = PKT_MAX, .offset = k * PKT_MAX };
-    NSMutableData *d = g_cbuf[i];
-    BOOL ok = usb_enqueue(g_cpipe, g_cap, d, tl, CAP_PKTS, &g_cframe, ^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
-        make_realtime();
-        if (st == kIOReturnSuccess) {
-            const uint8_t *p = d.bytes;
-            for (int k = 0; k < CAP_PKTS; k++) {
-                if (done[k].status != kIOReturnSuccess) S.cap_err++;
-                int n = done[k].completeCount / FRAME_BYTES;
-                if (n >= 5 && g_fifo_w - g_fifo_r < FIFO_N) g_fifo[g_fifo_w++ % FIFO_N] = n;
-                for (int f = 0; f < n; f++) {
-                    const uint8_t *q = p + done[k].offset + f * FRAME_BYTES;
-                    float fr[NCH];
-                    for (int c = 0; c < NCH; c++) {
-                        int32_t v = q[c * 3] | q[c * 3 + 1] << 8 | q[c * 3 + 2] << 16;
-                        if (v & 0x800000) v -= 1 << 24;
-                        fr[c] = v / 8388608.0f;
-                        float a = fabsf(fr[c]);
-                        if (a > g_pk_in[c]) g_pk_in[c] = a;
-                    }
-                    meter_update(0, fr);
-                    sring_put(&g_in, g_cap_s++, fr);
-                }
-            }
-            g_cap_done++;
-            double dl = ((double)mach_absolute_time() - (double)done[CAP_PKTS - 1].timeStamp) * g_tick_ns / 1e6;
-            if (done[CAP_PKTS - 1].timeStamp && dl > S.max_delay_ms) S.max_delay_ms = dl;
-            if (done[CAP_PKTS - 1].timeStamp) clk_update((double)g_cap_s, (double)done[CAP_PKTS - 1].timeStamp);
-        } else if (!usb_fatal(st)) S.xfer_err++;
-        if (st != kIOReturnSuccess && !g_stop) os_log_error(g_log, "capture transfer status 0x%x", st);
-        if (g_stop || usb_fatal(st)) { g_stop = 1; g_inflight--; return; }
-        cap_submit(i);
-    });
-    if (!ok) { g_inflight--; g_stop = 1; }
-}
-
-static void play_submit(int i) {
-    IOUSBHostIsochronousTransaction *tl = g_ptl[i];
-    uint8_t *p = g_pbuf[i].mutableBytes;
-    if (g_play_resync) {   /* schedule slipped: re-derive the sample time of this transfer's first frame */
-        g_play_resync = 0;
-        S.play_resyncs++;
-        g_play_s = (uint64_t)llround(clk_sample_at(usb_frame_host(g_play, g_pframe)));
-    }
-    uint64_t f_usb = g_pframe;
-    uint64_t s0 = g_play_s;
-    uint16_t pkt_n[PLAY_PKTS], pkt_off[PLAY_PKTS];
-    int off = 0;
-    for (int k = 0; k < PLAY_PKTS; k++) {
-        int n;
-        if (g_fifo_r != g_fifo_w) n = g_fifo[g_fifo_r++ % FIFO_N];
-        else { g_acc += RATE * 125e-6; n = (int)g_acc; g_acc -= n; }
-        if (n < 0 || n > PKT_MAX / FRAME_BYTES) n = 5;
-        pkt_n[k] = (uint16_t)n;
-        pkt_off[k] = (uint16_t)off;
-        for (int f = 0; f < n; f++) {
-            float fr[NCH];
-            if (sring_get(&g_out, g_play_s, fr)) {
-                for (int c = 0; c < NCH; c++) { float a = fabsf(fr[c]); if (a > g_pk_usb[c]) g_pk_usb[c] = a; }
-                pack_24le(p + off + f * FRAME_BYTES, fr);
-            } else {
-                memset(p + off + f * FRAME_BYTES, 0, FRAME_BYTES);
-            }
-            g_play_s++;
-        }
-        tl[k] = (IOUSBHostIsochronousTransaction){ .requestCount = (uint32_t)(n * FRAME_BYTES), .offset = (uint32_t)off };
-        off += n * FRAME_BYTES;
-    }
-    uint32_t tot = (uint32_t)(g_play_s - s0);
-    BOOL ok = usb_enqueue(g_ppipe, g_play, g_pbuf[i], tl, PLAY_PKTS, &g_pframe, ^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
-        make_realtime();
-        if (st == kIOReturnSuccess) { for (int k = 0; k < PLAY_PKTS; k++) if (done[k].status != kIOReturnSuccess) S.play_err++; }
-        else if (!usb_fatal(st)) S.xfer_err++;
-        if (st != kIOReturnSuccess && !g_stop) os_log_error(g_log, "playback transfer status 0x%x", st);
-        if (g_stop || usb_fatal(st)) { g_stop = 1; g_inflight--; return; }
-        play_submit(i);
-    });
-    if (ok) {
-        dp_slot_t *sl = &g_dp_sched[f_usb & DP_MASK];
-        atomic_fetch_add_explicit(&sl->seq, 1, memory_order_acq_rel);
-        sl->frame = f_usb;
-        sl->s0 = s0;
-        sl->total = tot;
-        memcpy(sl->pkt_n, pkt_n, sizeof(pkt_n));
-        memcpy(sl->pkt_off, pkt_off, sizeof(pkt_off));
-        sl->buf = p;
-        atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);
-        atomic_store_explicit(&g_dp_newest_s0, s0, memory_order_relaxed);
-        atomic_store_explicit(&g_dp_newest_frame, f_usb, memory_order_release);
+static OSStatus vol_set_property(AudioObjectID oid, AudioObjectPropertySelector s, UInt32 inSize, const void *inData) {
+    if (!vol_property_settable(oid, s)) return kAudioHardwareUnsupportedOperationError;
+    if (!inData || inSize < vol_property_size(oid, s)) return kAudioHardwareBadPropertySizeError;
+    int v = vol_index(oid);
+    if (v >= 0 && !isfinite(*(const Float32*)inData)) return kAudioHardwareIllegalOperationError;
+    /* Store the new level or mute and recompute the gains as one step. */
+    bool changed;
+    pthread_mutex_lock(&g_vol_mtx);
+    if (v >= 0) {
+        Float32 x = *(const Float32*)inData;
+        float db = s == kAudioLevelControlPropertyScalarValue ? vol_scalar_to_db(x)
+                 : (x < VOL_MIN_DB ? VOL_MIN_DB : x > VOL_MAX_DB ? VOL_MAX_DB : x);
+        changed = db != atomic_load(&g_vol_db[v]);
+        atomic_store(&g_vol_db[v], db);
     } else {
-        g_inflight--; g_stop = 1;
+        bool mute = *(const UInt32*)inData != 0;
+        changed = mute != atomic_load(&g_vol_mute);
+        atomic_store(&g_vol_mute, mute);
     }
-}
-
-static void ensure_q(void) {
-    if (!g_q) {
-        dispatch_queue_attr_t qa = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
-        g_q = dispatch_queue_create("sl3.usb", qa);
-    }
-}
-
-static int usb_ensure_configured(void) {
-    ensure_q();
-    io_service_t dsvc = usb_find("IOUSBHostDevice", -1);
-    if (!dsvc) { os_log_error(g_log, "SL3 not found"); return -1; }
-    io_service_t isvc = usb_find("IOUSBHostInterface", IF_HID);
-    if (isvc) {
-        IOObjectRelease(isvc);
-        IOObjectRelease(dsvc);
-        return 0;
-    }
-    NSError *e = nil;
-    IOUSBHostDevice *dev = [[IOUSBHostDevice alloc] initWithIOService:dsvc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-    if (!dev || ![dev configureWithValue:1 matchInterfaces:YES error:&e]) {
-        os_log_error(g_log, "set configuration failed: %{public}@", e.localizedDescription);
-        IOObjectRelease(dsvc);
-        return -1;
-    }
-    [dev destroy];
-    for (int i = 0; i < 30 && !(isvc = usb_find("IOUSBHostInterface", IF_HID)); i++) usleep(100000);
-    if (isvc) IOObjectRelease(isvc);
-    IOObjectRelease(dsvc);
+    if (changed) vol_update_gain();
+    pthread_mutex_unlock(&g_vol_mtx);
+    if (changed) vol_notify(oid);
     return 0;
 }
 
-static void hb_read(void) {
-    if (g_hid_stop || !g_hin) return;
-    g_hb_inflight++;
-    BOOL ok = [g_hin enqueueIORequestWithData:g_hb_in completionTimeout:0 error:nil completionHandler:^(IOReturn st, NSUInteger n) {
-        const uint8_t *b = g_hb_in.bytes;
-        if (st == kIOReturnSuccess && n >= 5) {
-            uint32_t s; memcpy(&s, b + 1, 4);
-            if (!g_wait_done && g_wait_sem && b[0] == g_wait_cmd && s == g_wait_seq) {
-                memcpy(g_wait_reply, b, HID_REPORT);
-                g_wait_done = 1;
-                if (b[0] == 0x37) S.hb_replies++;
-                dispatch_semaphore_signal(g_wait_sem);
-            } else if (b[0] == 0x37 && s == g_hb_seq) {
-                S.hb_replies++;
-            } else if (b[0] == 0x34 && n >= 11) {
-                memcpy(g_st.ovl, b + 5, 6);
-                g_st.ovl_seq++;
-                os_log(g_log, "overload status: [%u %u | %u %u | %u %u]", b[5], b[6], b[7], b[8], b[9], b[10]);
-            } else if (b[0] == 0x38 && n >= 8) {
-                memcpy(g_st.phono, b + 5, 3);
-                g_st.phono_seq++;
-                os_log(g_log, "phono/line switches: aux=%u left=%u right=%u", b[5], b[6], b[7]);
-            } else if (b[0] == 0x39 && n >= 9) {
-                memcpy(g_st.thru, b + 5, 4);
-                g_st.thru_seq++;
-                os_log(g_log, "thru state: aux=%u left=%u right=%u", b[5], b[6], b[7]);
-            }
+static Boolean SL3_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr) {
+    if (!addr) return false;
+    AudioObjectPropertySelector s = addr->mSelector;
+    AudioObjectPropertyScope sc = addr->mScope;
+
+    /* The plug-in object */
+    if (oid == kObjPlugIn) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner:
+            case kAudioObjectPropertyManufacturer:
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioPlugInPropertyDeviceList:
+            case kAudioPlugInPropertyTranslateUIDToDevice:
+            case kAudioPlugInPropertyResourceBundle:
+                return true;
         }
-        g_hb_inflight--;
-        if (!g_hid_stop && !usb_fatal(st)) hb_read();
-    }];
-    if (!ok) g_hb_inflight--;
-}
-
-static void hid_close_locked(void) {
-    g_hid_stop = 1;
-    if (g_hin) [g_hin abortWithError:nil];
-    if (g_hout) [g_hout abortWithError:nil];
-    for (int i = 0; i < 200 && g_hb_inflight > 0; i++) usleep(5000);
-    if (g_q) dispatch_sync(g_q, ^{});
-    if (g_hid) [g_hid destroy];
-    g_hid = nil;
-    g_hout = g_hin = nil;
-    g_req_out = g_req_in = g_hb_out = g_hb_in = nil;
-}
-
-static void hid_close(void) {
-    pthread_mutex_lock(&g_hid_lock);
-    hid_close_locked();
-    pthread_mutex_unlock(&g_hid_lock);
-}
-
-static int hid_open_if_needed_locked(void) {
-    if (g_hid && g_hout && g_hin && !g_hid_stop) return 0;
-    hid_close_locked();
-    if (usb_ensure_configured()) return -1;
-    NSError *e = nil;
-    if (!((g_hid = usb_open(IF_HID)) && (g_hout = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e]) &&
-          (g_hin = [g_hid copyPipeWithAddress:EP_HID_IN error:&e]) &&
-          (g_req_out = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) && (g_req_in = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) &&
-          (g_hb_out = [g_hid ioDataWithCapacity:HID_REPORT error:&e]) && (g_hb_in = [g_hid ioDataWithCapacity:HID_REPORT error:&e]))) {
-        os_log_error(g_log, "interface 3 unavailable: %{public}@", e ? e.localizedDescription : @"open failed");
-        hid_close_locked();
-        return -1;
+        return false;
     }
-    g_hid_stop = 0;
-    g_hb_inflight = 0;
-    g_hb_busy = 0;
-    uint8_t init_out[HID_REPORT] = {0x36, 0xff, 0xff, 0xff, 0xff, 0x01};
-    pthread_mutex_lock(&g_hout_lock);
-    memcpy(g_req_out.mutableBytes, init_out, HID_REPORT);
-    NSUInteger init_n = 0;
-    [g_hout sendIORequestWithData:g_req_out bytesTransferred:&init_n completionTimeout:0 error:nil];
-    pthread_mutex_unlock(&g_hout_lock);
-    usleep(10000);
-    dispatch_sync(g_q, ^{ hb_read(); });
-    return 0;
-}
-
-/* Interface 3: synchronous request multiplexed through hb_read(). */
-static int hid_request(uint8_t cmd, const uint8_t *payload, int len, uint8_t *reply) {
-    if (len < 0 || len > HID_REPORT - 5) return -1;
-    pthread_mutex_lock(&g_hid_lock);
-    if (hid_open_if_needed_locked()) {
-        pthread_mutex_unlock(&g_hid_lock);
-        return -1;
-    }
-    if (cmd == 0x37) g_last_client_hb = mach_absolute_time();
-
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    uint32_t seq = atomic_fetch_add(&g_hid_seq, 1);
-    g_wait_cmd = cmd;
-    g_wait_seq = seq;
-    g_wait_done = 0;
-    g_wait_sem = sem;
-
-    pthread_mutex_lock(&g_hout_lock);
-    uint8_t *out = g_req_out.mutableBytes;
-    memset(out, 0, HID_REPORT);
-    out[0] = cmd;
-    memcpy(out + 1, &seq, 4);
-    if (len) memcpy(out + 5, payload, len);
-    NSUInteger n = 0;
-    BOOL sent = [g_hout sendIORequestWithData:g_req_out bytesTransferred:&n completionTimeout:0 error:nil];
-    pthread_mutex_unlock(&g_hout_lock);
-
-    if (!sent) {
-        g_wait_sem = nil;
-        g_wait_done = 1;
-        hid_close_locked();
-        pthread_mutex_unlock(&g_hid_lock);
-        return -1;
-    }
-    if (cmd == 0x37) S.hb_sent++;
-
-    long w = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC));
-    int ok = (w == 0 && g_wait_done);
-    if (ok && reply) {
-        memcpy(reply, g_wait_reply, HID_REPORT);
-        if (cmd == 0x32) {
-            memcpy(g_st.phono, reply + 5, 3);
-            g_st.thru[0] = reply[5 + 8];
-            g_st.thru[1] = reply[5 + 14];
-            g_st.thru[2] = reply[5 + 20];
+    /* The device, including the SL 3's custom properties ('sl3h', 'sl3s', 'sl3q') */
+    if (oid == kObjDevice) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner:
+            case kAudioObjectPropertyName:
+            case kAudioObjectPropertyManufacturer:
+            case kAudioObjectPropertyModelName:
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioDevicePropertyDeviceUID:
+            case kAudioDevicePropertyModelUID:
+            case kAudioDevicePropertyTransportType:
+            case kAudioDevicePropertyRelatedDevices:
+            case kAudioDevicePropertyClockDomain:
+            case kAudioDevicePropertyDeviceIsAlive:
+            case kAudioDevicePropertyDeviceIsRunning:
+            case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+            case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
+            case kAudioDevicePropertyLatency:
+            case kAudioDevicePropertyStreams:
+            case kAudioObjectPropertyControlList:
+            case kAudioDevicePropertySafetyOffset:
+            case kAudioDevicePropertyNominalSampleRate:
+            case kAudioDevicePropertyAvailableNominalSampleRates:
+            case kAudioDevicePropertyIsHidden:
+            case kAudioDevicePropertyZeroTimeStampPeriod:
+            case kAudioDevicePropertyPreferredChannelsForStereo:
+            case kAudioDevicePropertyPreferredChannelLayout:
+            case kAudioObjectPropertyElementName:
+            case kSL3PropHIDCommand:
+            case kSL3PropStatus:
+            case kSL3PropUnsolQueue:
+            case kSL3PropMeters:
+            case kSL3PropInSafety:
+            case kAudioObjectPropertyCustomPropertyInfoList:
+                return true;
         }
+        return false;
     }
-    if (cmd == 0x33 && ok && payload && len >= 3) {
-        uint8_t off = payload[0], cnt = payload[1];
-        for (int i = 0; i < cnt && i + 2 < len; i++) {
-            uint8_t idx = off + i, val = payload[2 + i];
-            if (idx < 3) { g_st.phono[idx] = val; g_st.phono_seq++; }
-            else if (idx == 8)  { g_st.thru[0] = val; g_st.thru_seq++; }
-            else if (idx == 14) { g_st.thru[1] = val; g_st.thru_seq++; }
-            else if (idx == 20) { g_st.thru[2] = val; g_st.thru_seq++; }
+    /* The input and output streams */
+    if (oid == kObjStreamIn || oid == kObjStreamOut) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner:
+            case kAudioObjectPropertyName:
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioStreamPropertyIsActive:
+            case kAudioStreamPropertyDirection:
+            case kAudioStreamPropertyTerminalType:
+            case kAudioStreamPropertyStartingChannel:
+            case kAudioStreamPropertyLatency:
+            case kAudioStreamPropertyVirtualFormat:
+            case kAudioStreamPropertyPhysicalFormat:
+            case kAudioStreamPropertyAvailableVirtualFormats:
+            case kAudioStreamPropertyAvailablePhysicalFormats:
+                return true;
         }
+        return false;
     }
-    g_wait_sem = nil;
-    g_wait_done = 1;
-    pthread_mutex_unlock(&g_hid_lock);
-    return ok ? 0 : -1;
+    /* The output volume and mute controls */
+    if (vol_is_control(oid)) return vol_has_property(oid, s);
+    (void)sc;
+    return false;
 }
 
-/* The 22 control bytes as hex, grouped per 6-byte deck block (indices 3-8, 9-14, 15-20). */
-static void log_controls(const char *tag, const uint8_t *c) {
-    char b[100]; int o = 0;
-    for (int i = 0; i < 22; i++) o += snprintf(b + o, sizeof b - o, "%s%02x", i == 3 || i == 9 || i == 15 || i == 21 ? " | " : i ? " " : "", c[i]);
-    os_log(g_log, "%{public}s: %{public}s", tag, b);
-}
-
-/* Per-deck switch bytes (indices 8, 14, 20): 01 = USB audio, 00 = thru. */
-static int set_usb_switches(uint8_t v) {
-    static const int idx[] = {8, 14, 20};
-    uint8_t in[HID_REPORT];
-    if (hid_request(0x32, NULL, 0, in)) { os_log_error(g_log, "could not read controls"); return -1; }
-    log_controls(v ? "controls before USB" : "controls before thru", in + 5);
-    int err = 0, changed = 0;
-    for (int i = 0; i < 3; i++) {
-        if (in[5 + idx[i]] == v) continue;
-        uint8_t p[3] = {(uint8_t)idx[i], 1, v};
-        uint8_t r[HID_REPORT];
-        if (hid_request(0x33, p, 3, r)) err = -1;
-        changed = 1;
+static OSStatus SL3_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, Boolean *outSettable) {
+    *outSettable = false;
+    if (oid == kObjDevice && (addr->mSelector == kAudioDevicePropertyNominalSampleRate || addr->mSelector == kSL3PropHIDCommand ||
+                              addr->mSelector == kSL3PropInSafety)) {
+        *outSettable = true;
+    } else if ((oid == kObjStreamIn || oid == kObjStreamOut) &&
+               (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
+        *outSettable = true;
+    } else if (vol_is_control(oid)) {
+        if (!vol_has_property(oid, addr->mSelector)) return kAudioHardwareUnknownPropertyError;
+        *outSettable = vol_property_settable(oid, addr->mSelector);
     }
-    if (changed && hid_request(0x32, NULL, 0, in) == 0) log_controls("controls after", in + 5);
-    return err;
+    return kAudioHardwareNoError;
 }
 
-static void hb_tick(void) {
-    if (g_stop || g_hid_stop || g_hb_busy || !g_hout) return;
-    uint64_t last = atomic_load(&g_last_client_hb);
-    if (last && (mach_absolute_time() - last) * g_tick_ns < 500e6) return;
-    pthread_mutex_lock(&g_hout_lock);
-    uint8_t *b = g_hb_out.mutableBytes;
-    g_hb_seq = atomic_fetch_add(&g_hid_seq, 1);
-    memset(b, 0, HID_REPORT);
-    b[0] = 0x37;
-    memcpy(b + 1, &g_hb_seq, 4);
-    arc4random_buf(b + 5, 8);
-    g_hb_busy = 1;
-    g_hb_inflight++;
-    BOOL ok = [g_hout enqueueIORequestWithData:g_hb_out completionTimeout:0 error:nil completionHandler:^(IOReturn st, NSUInteger n) {
-        (void)n;
-        if (st == kIOReturnSuccess) S.hb_sent++;
-        g_hb_busy = 0;
-        g_hb_inflight--;
-    }];
-    if (!ok) { g_hb_busy = 0; g_hb_inflight--; }
-    pthread_mutex_unlock(&g_hout_lock);
+/* kAudioObjectPropertyOwnedObjects can carry a qualifier: a list of class IDs. Only objects of
+   one of those classes (or of a class derived from it) are returned; no qualifier means all. */
+static bool owned_class_wanted(UInt32 qsz, const void *qd, AudioClassID cls) {
+    UInt32 n = qd ? qsz / sizeof(AudioClassID) : 0;
+    if (n == 0) return true;
+    const AudioClassID *c = (const AudioClassID *)qd;
+    for (UInt32 i = 0; i < n; i++)
+        if (c[i] == cls || c[i] == kAudioObjectClassID) return true;
+    return false;
 }
 
-static void usb_close(int present);
-static int usb_open_all(void);
-static void log_stats(const char *tag);
-static _Atomic int g_restarting;
-
-/* Streams died while IO is running: tear down and start again, retrying until
- * the box is back or IO stops. The device keeps its timeline; the clock model
- * resyncs with a new seed. */
-static void usb_restart(void);
-static void kick_restart(void) {
-    int z = 0;
-    if (atomic_compare_exchange_strong(&g_restarting, &z, 1))
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ usb_restart(); });
-}
-static void usb_restart(void) {
-    pthread_mutex_lock(&g_lock);
-    if (g_io_clients > 0) {
-        log_stats("restarting");
-        int present = usb_present();
-        usb_close(present);
-        while (g_io_clients > 0 && (!g_present || usb_open_all())) {
-            pthread_mutex_unlock(&g_lock);
-            usleep(200000);
-            pthread_mutex_lock(&g_lock);
-        }
-    }
-    g_restarting = 0;
-    pthread_mutex_unlock(&g_lock);
+/* Whether the class qualifier wants a control of class cls, which derives from base and that from
+   kAudioControlClassID. */
+static bool control_wanted(UInt32 qsz, const void *qd, AudioClassID cls, AudioClassID base) {
+    return owned_class_wanted(qsz, qd, cls) || owned_class_wanted(qsz, qd, base) ||
+           owned_class_wanted(qsz, qd, kAudioControlClassID);
 }
 
-static void log_stats(const char *tag) {
-    char pk[300]; int o = 0;
-    o += snprintf(pk + o, sizeof pk - o, "in peaks");
-    for (int c = 0; c < NCH; c++) { o += snprintf(pk + o, sizeof pk - o, " %.3f", g_pk_in[c]); g_pk_in[c] = 0; }
-    o += snprintf(pk + o, sizeof pk - o, " | out peaks hal");
-    for (int c = 0; c < NCH; c++) { o += snprintf(pk + o, sizeof pk - o, " %.3f", g_pk_hal[c]); g_pk_hal[c] = 0; }
-    o += snprintf(pk + o, sizeof pk - o, " usb");
-    for (int c = 0; c < NCH; c++) { o += snprintf(pk + o, sizeof pk - o, " %.3f", g_pk_usb[c]); g_pk_usb[c] = 0; }
-    os_log(g_log, "%{public}s: %{public}s", tag, pk);
-    os_log(g_log, "%{public}s: rate %.3f Hz, max clock err %.0f us, max delivery %.1f ms, resyncs %ld, play resyncs %ld, jumps in %ld out %ld, "
-           "miss in %ld out %ld, err cap %ld play %ld xfer %ld, hb %ld/%ld",
-           tag, S.rate, S.max_err_us, S.max_delay_ms, S.resyncs, S.play_resyncs, S.in_jumps, S.out_jumps,
-           S.in_miss, S.out_miss, S.cap_err, S.play_err, S.xfer_err, S.hb_replies, S.hb_sent);
-}
-
-static int usb_open_all(void) {
-    if (usb_ensure_configured()) return -1;
-
-    /* interface 3 first: set the rate before the streams start */
-    uint8_t rp[2] = {(uint8_t)((int)RATE >> 8), (uint8_t)(int)RATE}, reply[HID_REPORT];
-    if (hid_request(0x31, rp, 2, reply)) os_log_error(g_log, "set rate %.0f failed", RATE);
-    else usleep(20000);
-
-    NSError *e = nil;
-    g_cap = usb_open(IF_CAP);
-    g_play = usb_open(IF_PLAY);
-    if (!g_cap || !g_play || ![g_cap selectAlternateSetting:1 error:&e] || ![g_play selectAlternateSetting:1 error:&e] ||
-        !(g_cpipe = [g_cap copyPipeWithAddress:EP_CAP error:&e]) || !(g_ppipe = [g_play copyPipeWithAddress:EP_PLAY error:&e])) {
-        os_log_error(g_log, "stream setup failed: %{public}@", e ? e.localizedDescription : @"interface not found");
-        usb_close(1);
-        return -1;
-    }
-    for (int i = 0; i < CAP_NXF; i++) if (!(g_cbuf[i] = [g_cap ioDataWithCapacity:CAP_PKTS * PKT_MAX error:&e])) { usb_close(1); return -1; }
-    for (int i = 0; i < PLAY_NXF; i++) if (!(g_pbuf[i] = [g_play ioDataWithCapacity:PLAY_PKTS * PKT_MAX error:&e])) { usb_close(1); return -1; }
-
-    memset(&S, 0, sizeof S);
-    memset(&g_rate, 0, sizeof g_rate);
-    memset(g_dp_sched, 0, sizeof g_dp_sched);
-    atomic_store(&g_dp_newest_s0, 0);
-    atomic_store(&g_dp_newest_frame, 0);
-    vol_snap();
-    sring_clear(&g_in); sring_clear(&g_out);
-    g_stop = 0; g_inflight = 0;
-    g_fifo_w = g_fifo_r = 0; g_acc = 0;
-    /* after a restart, continue the timeline from where the old clock says we are */
-    double a_s0, a_h0, tpf0; uint64_t seed0; int valid0;
-    clk_read(&a_s0, &a_h0, &tpf0, &seed0, &valid0);
-    g_cap_s = valid0 ? (uint64_t)llround(a_s0 + ((double)mach_absolute_time() - a_h0) / tpf0) : 0;
-    g_reanchor = 1; g_cap_done = 0;
-
-    /* capture first; once the clock model has an anchor, start playback */
-    dispatch_sync(g_q, ^{
-        g_cframe = [g_cap frameNumberWithTime:NULL] + 8;
-        for (int i = 0; i < CAP_NXF && !g_stop; i++) { g_inflight++; cap_submit(i); }
-    });
-    usleep(50000);
-    __block int started;
-    dispatch_sync(g_q, ^{ started = g_cap_done > 0 && !g_reanchor; });
-    if (!started || g_stop) { os_log_error(g_log, "capture did not start"); usb_close(1); return -1; }
-    dispatch_sync(g_q, ^{
-        g_fifo_r = g_fifo_w;
-        g_pframe = [g_play frameNumberWithTime:NULL] + 8;
-        g_play_resync = 1;
-        for (int i = 0; i < PLAY_NXF && !g_stop; i++) { g_inflight++; play_submit(i); }
-    });
-    atomic_store(&g_dp_active, 1);
-
-    /* interface 3: switch the decks to USB audio and keep the heartbeat going */
-    if (g_hid) {
-        if (set_usb_switches(0x01)) os_log_error(g_log, "switch write incomplete");
-        g_hb_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
-        dispatch_source_set_timer(g_hb_timer, dispatch_time(DISPATCH_TIME_NOW, 0), HEARTBEAT_MS * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
-        dispatch_source_set_event_handler(g_hb_timer, ^{ hb_tick(); });
-        dispatch_resume(g_hb_timer);
-    }
-    g_in_next = g_out_next = 0;
-    g_stat_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
-    dispatch_source_set_timer(g_stat_timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(g_stat_timer, ^{
-        log_stats("stats");
-        S.max_err_us = 0; S.max_delay_ms = 0;
-        if (g_stop) kick_restart();
-    });
-    dispatch_resume(g_stat_timer);
-    os_log(g_log, "SL3 streaming");
-    return 0;
-}
-
-/* present: the box is still there, so reset alt settings and hand the decks back to thru. */
-static void usb_close(int present) {
-    g_stop = 1;
-    atomic_store(&g_dp_active, 0);
-    while (atomic_load(&g_dp_writers) > 0) usleep(100);
-    if (g_hb_timer) { dispatch_source_cancel(g_hb_timer); g_hb_timer = nil; }
-    if (g_stat_timer) { dispatch_source_cancel(g_stat_timer); g_stat_timer = nil; }
-    [g_cpipe abortWithError:nil];
-    [g_ppipe abortWithError:nil];
-    for (int i = 0; i < 200 && g_inflight > 0; i++) usleep(10000);
-    if (g_q) dispatch_sync(g_q, ^{});
-    if (g_hid) {
-        if (present && usb_present()) set_usb_switches(0x00);
-        else hid_close();
-    }
-    if (present) { [g_play selectAlternateSetting:0 error:nil]; [g_cap selectAlternateSetting:0 error:nil]; }
-    [g_cap destroy]; [g_play destroy];
-    if (g_q) dispatch_sync(g_q, ^{});
-    log_stats("stopped");
-    g_cap = g_play = nil;
-    g_cpipe = g_ppipe = nil;
-    for (int i = 0; i < CAP_NXF; i++) g_cbuf[i] = nil;
-    for (int i = 0; i < PLAY_NXF; i++) g_pbuf[i] = nil;
-}
-
-/* ---- hot-plug: IOKit attach/detach notifications for the SL3 ---- */
-static dispatch_queue_t g_nq;
-static IONotificationPortRef g_nport;
-static io_iterator_t g_add_it, g_rem_it;
-
-/* Report the device appearing or disappearing. Runs on g_nq, never from
- * inside a host call. */
-static void update_visibility(void) {
-    int v = g_present || g_io_clients > 0;
-    if (atomic_exchange(&g_visible, v) == v) return;
-    os_log(g_log, "device %{public}s", v ? "shown" : "hidden");
-    AudioObjectPropertyAddress pa[2] = {
-        {kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
-        {kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain}};
-    AudioObjectPropertyAddress da = {kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-    g_host->PropertiesChanged(g_host, kObjDevice, 1, &da);
-    g_host->PropertiesChanged(g_host, kAudioObjectPlugInObject, 2, pa);
-}
-static void presence_changed(int present) {
-    if (atomic_exchange(&g_present, present) == present) return;
-    os_log(g_log, "SL3 %{public}s", present ? "attached" : "detached");
-    if (!present) hid_close();
-    /* streams fail on their own when the box goes; stop them now rather than
-     * at the next stats tick, and restart once it is back */
-    if (g_io_clients > 0) { if (!present) g_stop = 1; if (g_stop) kick_restart(); }
-    update_visibility();
-}
-static int drain(io_iterator_t it) {
-    int n = 0; io_object_t o;
-    while ((o = IOIteratorNext(it))) { IOObjectRelease(o); n++; }
+/* The device's owned objects in a scope, filtered by the class qualifier: the streams, and the
+   output volume and mute controls. */
+#define DEVICE_NOWNED   (2 + VOL_NCONTROLS)   /* the two streams and the controls */
+static UInt32 device_owned_objects(AudioObjectPropertyScope sc, UInt32 qsz, const void *qd, AudioObjectID ids[DEVICE_NOWNED]) {
+    UInt32 n = 0;
+    bool in = sc != kAudioObjectPropertyScopeOutput, out = sc != kAudioObjectPropertyScopeInput;
+    if (in  && owned_class_wanted(qsz, qd, kAudioStreamClassID)) ids[n++] = kObjStreamIn;
+    if (out && owned_class_wanted(qsz, qd, kAudioStreamClassID)) ids[n++] = kObjStreamOut;
+    bool vol  = out && control_wanted(qsz, qd, kAudioVolumeControlClassID, kAudioLevelControlClassID);
+    bool mute = out && control_wanted(qsz, qd, kAudioMuteControlClassID, kAudioBooleanControlClassID);
+    for (int i = 0; i < VOL_NCONTROLS; i++)
+        if (kControlObjs[i] == kObjMute ? mute : vol) ids[n++] = kControlObjs[i];
     return n;
 }
-static void on_added(void *r, io_iterator_t it) { (void)r; if (drain(it)) presence_changed(1); }
-static void on_removed(void *r, io_iterator_t it) { (void)r; if (drain(it)) presence_changed(0); }
 
-static void hotplug_start(void) {
-    g_nq = dispatch_queue_create("sl3.hotplug", DISPATCH_QUEUE_SERIAL);
-    g_nport = IONotificationPortCreate(kIOMainPortDefault);
-    IONotificationPortSetDispatchQueue(g_nport, g_nq);
-    NSDictionary *p = @{@"idVendor": @VID, @"idProduct": @PID};
-    for (int i = 0; i < 2; i++) {
-        CFMutableDictionaryRef m = IOServiceMatching("IOUSBHostDevice");
-        CFDictionarySetValue(m, CFSTR(kIOPropertyMatchKey), (__bridge CFDictionaryRef)p);
-        if (i == 0) IOServiceAddMatchingNotification(g_nport, kIOFirstMatchNotification, m, on_added, NULL, &g_add_it);
-        else IOServiceAddMatchingNotification(g_nport, kIOTerminatedNotification, m, on_removed, NULL, &g_rem_it);
+static void fill_asbd(AudioStreamBasicDescription *a, Float64 sr) {
+    memset(a, 0, sizeof(*a));
+    a->mSampleRate       = sr;
+    a->mFormatID         = kAudioFormatLinearPCM;
+    a->mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
+    a->mBytesPerPacket   = NCH * sizeof(Float32);
+    a->mFramesPerPacket  = 1;
+    a->mBytesPerFrame    = NCH * sizeof(Float32);
+    a->mChannelsPerFrame = NCH;
+    a->mBitsPerChannel   = 32;
+}
+
+static OSStatus SL3_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 *outSize) {
+    AudioObjectPropertySelector s = addr->mSelector;
+    AudioObjectPropertyScope sc = addr->mScope;
+
+    /* The plug-in object */
+    if (oid == kObjPlugIn) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner: *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyManufacturer:
+            case kAudioPlugInPropertyResourceBundle: *outSize = sizeof(CFStringRef); return 0;
+            case kAudioObjectPropertyOwnedObjects:
+                *outSize = (device_published() && owned_class_wanted(qsz, qd, kAudioDeviceClassID)) ? sizeof(AudioObjectID) : 0;
+                return 0;
+            case kAudioPlugInPropertyDeviceList: *outSize = device_published() ? sizeof(AudioObjectID) : 0; return 0;
+            case kAudioPlugInPropertyTranslateUIDToDevice: *outSize = sizeof(AudioObjectID); return 0;
+        }
     }
-    /* arm both iterators; the initial state is set without notifying the host */
-    dispatch_sync(g_nq, ^{ g_present = g_visible = drain(g_add_it) > 0; drain(g_rem_it); });
-}
-
-/* ---- AudioServerPlugIn driver interface ---- */
-static HRESULT QI(void *d, REFIID iid, LPVOID *out);
-static ULONG AddRef(void *d) { (void)d; return ++g_refs; }
-static ULONG Release(void *d) { (void)d; return g_refs > 0 ? --g_refs : 0; }
-
-static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host) {
-    (void)d;
-    g_host = host;
-    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
-    g_tick_ns = (double)tb.numer / tb.denom;
-    CFPropertyListRef saved = NULL;
-    if (host->CopyFromStorage(host, RATE_KEY, &saved) == noErr && saved) {
-        double r = 0;
-        if (CFGetTypeID(saved) == CFNumberGetTypeID()) CFNumberGetValue(saved, kCFNumberDoubleType, &r);
-        if (r == 44100 || r == 48000) g_rate_hz = r;
-        CFRelease(saved);
-    }
-    hotplug_start();
-    os_log(g_log, "Initialize, SL3 %{public}s, %.0f Hz", g_present ? "present" : "not present", g_rate_hz);
-    return noErr;
-}
-static OSStatus CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc, const AudioServerPlugInClientInfo *c, AudioObjectID *o) { (void)d; (void)desc; (void)c; (void)o; return kAudioHardwareUnsupportedOperationError; }
-static OSStatus DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID o) { (void)d; (void)o; return kAudioHardwareUnsupportedOperationError; }
-static OSStatus AddClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return noErr; }
-static OSStatus RemoveClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return noErr; }
-static OSStatus PerformCfg(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) {
-    (void)d; (void)i;
-    if (o != kObjDevice || (a != 44100 && a != 48000)) return kAudioHardwareBadObjectError;
-    pthread_mutex_lock(&g_lock);
-    if (a != (UInt64)RATE) {
-        g_rate_hz = (double)a;
-        /* new timeline: the clock model starts again from the next StartIO */
-        atomic_fetch_add(&g_clk.seq, 1); g_clk.valid = 0; atomic_fetch_add(&g_clk.seq, 1);
-        CFNumberRef n = CFNumberCreate(NULL, kCFNumberDoubleType, &g_rate_hz);
-        g_host->WriteToStorage(g_host, RATE_KEY, n);
-        CFRelease(n);
-        if (g_present) {
-            uint8_t rp[2] = {(uint8_t)((int)RATE >> 8), (uint8_t)(int)RATE}, reply[HID_REPORT];
-            hid_request(0x31, rp, 2, reply);
-        }
-        os_log(g_log, "sample rate %.0f Hz", g_rate_hz);
-    }
-    pthread_mutex_unlock(&g_lock);
-    return noErr;
-}
-static OSStatus AbortCfg(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return noErr; }
-
-static AudioStreamBasicDescription format_at(double rate) {
-    return (AudioStreamBasicDescription){
-        .mSampleRate = rate, .mFormatID = kAudioFormatLinearPCM,
-        .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
-        .mBytesPerPacket = 4 * NCH, .mFramesPerPacket = 1, .mBytesPerFrame = 4 * NCH,
-        .mChannelsPerFrame = NCH, .mBitsPerChannel = 32 };
-}
-static AudioStreamBasicDescription stream_format(void) { return format_at(RATE); }
-
-/* Property table: returns the value size, or 0 if the object has no such property.
- * With data != NULL, also writes the value (data must hold the returned size). */
-static UInt32 prop(AudioObjectID o, const AudioObjectPropertyAddress *a, const void *qual, void *data) {
-    #define RET(type, val) do { if (data) *(type *)data = (val); return sizeof(type); } while (0)
-    AudioObjectPropertyScope sc = a->mScope;
-    switch (o) {
-    case kObjPlugIn:
-        switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
-        case kAudioObjectPropertyClass: RET(AudioClassID, kAudioPlugInClassID);
-        case kAudioObjectPropertyOwner: RET(AudioObjectID, kAudioObjectUnknown);
-        case kAudioObjectPropertyManufacturer: RET(CFStringRef, CFSTR("OpenSL3"));
-        case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList:
-            if (!g_visible) return 0;
-            RET(AudioObjectID, kObjDevice);
-        case kAudioPlugInPropertyTranslateUIDToDevice: {
-            CFStringRef uid = qual ? *(const CFStringRef *)qual : NULL;
-            RET(AudioObjectID, g_visible && uid && CFEqual(uid, DEVICE_UID) ? kObjDevice : kAudioObjectUnknown);
-        }
-        case kAudioPlugInPropertyResourceBundle: RET(CFStringRef, CFSTR(""));
-        }
-        return 0;
-    case kObjDevice:
-        switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
-        case kAudioObjectPropertyClass: RET(AudioClassID, kAudioDeviceClassID);
-        case kAudioObjectPropertyOwner: RET(AudioObjectID, kObjPlugIn);
-        case kAudioObjectPropertyName: RET(CFStringRef, CFSTR("SL 3"));
-        case kAudioObjectPropertyManufacturer: RET(CFStringRef, CFSTR("Rane"));
-        case kAudioDevicePropertyDeviceUID: RET(CFStringRef, DEVICE_UID);
-        case kAudioDevicePropertyModelUID: RET(CFStringRef, MODEL_UID);
-        case kAudioDevicePropertyTransportType: RET(UInt32, kAudioDeviceTransportTypeUSB);
-        case kAudioDevicePropertyRelatedDevices: RET(AudioObjectID, kObjDevice);
-        case kAudioDevicePropertyClockDomain: RET(UInt32, 0);
-        case kAudioDevicePropertyDeviceIsAlive: RET(UInt32, g_visible);
-        case kAudioDevicePropertyDeviceIsRunning: RET(UInt32, g_io_clients > 0);
-        case kAudioDevicePropertyDeviceCanBeDefaultDevice: RET(UInt32, 1);
-        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: RET(UInt32, 0);
-        case kAudioDevicePropertyLatency: RET(UInt32, AT_RATE(sc == kAudioObjectPropertyScopeInput ? LAT_IN : LAT_OUT));
-        case kAudioDevicePropertySafetyOffset: RET(UInt32, AT_RATE(sc == kAudioObjectPropertyScopeInput ? IN_SAFETY : OUT_SAFETY));
-        case kAudioDevicePropertyNominalSampleRate: RET(Float64, RATE);
-        case kAudioDevicePropertyAvailableNominalSampleRates:
-            if (data) { ((AudioValueRange *)data)[0] = (AudioValueRange){44100, 44100}; ((AudioValueRange *)data)[1] = (AudioValueRange){48000, 48000}; }
-            return 2 * sizeof(AudioValueRange);
-        case kAudioDevicePropertyIsHidden: RET(UInt32, 0);
-        case kAudioDevicePropertyZeroTimeStampPeriod: RET(UInt32, ZTS_PERIOD);
-        case kAudioDevicePropertyPreferredChannelsForStereo: {
-            if (data) { ((UInt32 *)data)[0] = 1; ((UInt32 *)data)[1] = 2; }
-            return 2 * sizeof(UInt32);
-        }
-        case kAudioObjectPropertyCustomPropertyInfoList: {
-            if (data) {
-                AudioServerPlugInCustomPropertyInfo *ci = (AudioServerPlugInCustomPropertyInfo *)data;
-                ci[0] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropHIDRequest, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList };
-                ci[1] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropStatus,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
-                ci[2] = (AudioServerPlugInCustomPropertyInfo){ kSL3PropMeters,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+    /* The device, including the SL 3's custom properties */
+    if (oid == kObjDevice) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner: *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyName:
+            case kAudioObjectPropertyManufacturer:
+            case kAudioObjectPropertyModelName:
+            case kAudioDevicePropertyDeviceUID:
+            case kAudioDevicePropertyModelUID:
+            case kAudioObjectPropertyElementName: *outSize = sizeof(CFStringRef); return 0;
+            case kAudioDevicePropertyTransportType:
+            case kAudioDevicePropertyClockDomain:
+            case kAudioDevicePropertyDeviceIsAlive:
+            case kAudioDevicePropertyDeviceIsRunning:
+            case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+            case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
+            case kAudioDevicePropertyLatency:
+            case kAudioDevicePropertySafetyOffset:
+            case kAudioDevicePropertyIsHidden:
+            case kAudioDevicePropertyZeroTimeStampPeriod: *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyRelatedDevices: *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioObjectPropertyOwnedObjects: {
+                AudioObjectID ids[DEVICE_NOWNED];
+                *outSize = device_owned_objects(sc, qsz, qd, ids) * sizeof(AudioObjectID);
+                return 0;
             }
-            return 3 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            case kAudioDevicePropertyStreams:
+                if (sc == kAudioObjectPropertyScopeInput || sc == kAudioObjectPropertyScopeOutput) *outSize = sizeof(AudioObjectID);
+                else *outSize = 2 * sizeof(AudioObjectID);
+                return 0;
+            case kAudioObjectPropertyControlList: *outSize = sizeof kControlObjs; return 0;
+            case kAudioDevicePropertyNominalSampleRate: *outSize = sizeof(Float64); return 0;
+            case kAudioDevicePropertyAvailableNominalSampleRates: *outSize = 2 * sizeof(AudioValueRange); return 0;
+            case kAudioDevicePropertyPreferredChannelsForStereo: *outSize = 2 * sizeof(UInt32); return 0;
+            case kAudioDevicePropertyPreferredChannelLayout:
+                *outSize = offsetof(AudioChannelLayout, mChannelDescriptions) + NCH * sizeof(AudioChannelDescription);
+                return 0;
+            case kSL3PropHIDCommand:
+            case kSL3PropStatus:
+            case kSL3PropUnsolQueue:
+            case kSL3PropMeters: *outSize = sizeof(CFDataRef); return 0;
+            case kSL3PropInSafety: *outSize = sizeof(CFNumberRef); return 0;
+            case kAudioObjectPropertyCustomPropertyInfoList: *outSize = 5 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
         }
-        case kAudioObjectPropertyControlList:
-            if (data) memcpy(data, kControlObjs, sizeof(kControlObjs));
-            return sizeof(kControlObjs);
-        case kAudioDevicePropertyStreams: {
-            int nin = sc != kAudioObjectPropertyScopeOutput, nout = sc != kAudioObjectPropertyScopeInput;
-            if (data) { AudioObjectID *p = data; if (nin) *p++ = kObjStreamIn; if (nout) *p = kObjStreamOut; }
-            return (UInt32)((nin + nout) * sizeof(AudioObjectID));
+    }
+    /* The input and output streams */
+    if (oid == kObjStreamIn || oid == kObjStreamOut) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner: *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyName: *outSize = sizeof(CFStringRef); return 0;
+            case kAudioObjectPropertyOwnedObjects: *outSize = 0; return 0;
+            case kAudioStreamPropertyIsActive:
+            case kAudioStreamPropertyDirection:
+            case kAudioStreamPropertyTerminalType:
+            case kAudioStreamPropertyStartingChannel:
+            case kAudioStreamPropertyLatency: *outSize = sizeof(UInt32); return 0;
+            case kAudioStreamPropertyVirtualFormat:
+            case kAudioStreamPropertyPhysicalFormat: *outSize = sizeof(AudioStreamBasicDescription); return 0;
+            case kAudioStreamPropertyAvailableVirtualFormats:
+            case kAudioStreamPropertyAvailablePhysicalFormats: *outSize = 2 * sizeof(AudioStreamRangedDescription); return 0;
         }
-        case kAudioObjectPropertyOwnedObjects: {
-            int nin = sc != kAudioObjectPropertyScopeOutput, nout = sc != kAudioObjectPropertyScopeInput;
-            int nctrl = (sc == kAudioObjectPropertyScopeGlobal || sc == kAudioObjectPropertyScopeOutput) ? VOL_NCONTROLS : 0;
-            if (data) {
-                AudioObjectID *p = data;
-                if (nin) *p++ = kObjStreamIn;
-                if (nout) *p++ = kObjStreamOut;
-                if (nctrl) memcpy(p, kControlObjs, sizeof(kControlObjs));
-            }
-            return (UInt32)((nin + nout + nctrl) * sizeof(AudioObjectID));
-        }
-        }
-        return 0;
-    case kObjStreamIn: case kObjStreamOut:
-        switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
-        case kAudioObjectPropertyClass: RET(AudioClassID, kAudioStreamClassID);
-        case kAudioObjectPropertyOwner: RET(AudioObjectID, kObjDevice);
-        case kAudioStreamPropertyIsActive: RET(UInt32, 1);
-        case kAudioStreamPropertyDirection: RET(UInt32, o == kObjStreamIn);
-        case kAudioStreamPropertyTerminalType: RET(UInt32, kAudioStreamTerminalTypeLine);
-        case kAudioStreamPropertyStartingChannel: RET(UInt32, 1);
-        case kAudioStreamPropertyLatency: RET(UInt32, 0);
-        case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat: RET(AudioStreamBasicDescription, stream_format());
-        case kAudioStreamPropertyAvailableVirtualFormats: case kAudioStreamPropertyAvailablePhysicalFormats:
-            if (data) {
-                ((AudioStreamRangedDescription *)data)[0] = (AudioStreamRangedDescription){format_at(44100), {44100, 44100}};
-                ((AudioStreamRangedDescription *)data)[1] = (AudioStreamRangedDescription){format_at(48000), {48000, 48000}};
-            }
-            return 2 * sizeof(AudioStreamRangedDescription);
-        }
-        return 0;
-    case kObjVolume: case kObjVolCh1: case kObjVolCh2: case kObjVolCh3:
-    case kObjVolCh4: case kObjVolCh5: case kObjVolCh6: case kObjMute: {
-        static CFStringRef const vnames[1 + NCH] = {
-            CFSTR("Output Volume"), CFSTR("Aux Out L"), CFSTR("Aux Out R"),
-            CFSTR("Left Deck Out L"), CFSTR("Left Deck Out R"),
-            CFSTR("Right Deck Out L"), CFSTR("Right Deck Out R")
-        };
-        int v = vol_index(o);
-        switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass: RET(AudioClassID, v >= 0 ? kAudioLevelControlClassID : kAudioBooleanControlClassID);
-        case kAudioObjectPropertyClass: RET(AudioClassID, v >= 0 ? kAudioVolumeControlClassID : kAudioMuteControlClassID);
-        case kAudioObjectPropertyOwner: RET(AudioObjectID, kObjDevice);
-        case kAudioObjectPropertyName: RET(CFStringRef, v >= 0 ? vnames[v] : CFSTR("Output Mute"));
-        case kAudioControlPropertyScope: RET(AudioObjectPropertyScope, kAudioObjectPropertyScopeOutput);
-        case kAudioControlPropertyElement: RET(AudioObjectPropertyElement, v > 0 ? (UInt32)v : kAudioObjectPropertyElementMain);
-        case kAudioLevelControlPropertyScalarValue: if (v >= 0) RET(Float32, vol_db_to_scalar(atomic_load(&g_vol_db[v]))); break;
-        case kAudioLevelControlPropertyDecibelValue: if (v >= 0) RET(Float32, atomic_load(&g_vol_db[v])); break;
-        case kAudioLevelControlPropertyDecibelRange:
-            if (v >= 0) { if (data) *(AudioValueRange *)data = (AudioValueRange){VOL_MIN_DB, VOL_MAX_DB}; return sizeof(AudioValueRange); }
-            break;
-        case kAudioLevelControlPropertyConvertScalarToDecibels:
-            if (v >= 0) { if (data) *(Float32 *)data = vol_scalar_to_db(*(Float32 *)data); return sizeof(Float32); }
-            break;
-        case kAudioLevelControlPropertyConvertDecibelsToScalar:
-            if (v >= 0) { if (data) *(Float32 *)data = vol_db_to_scalar(*(Float32 *)data); return sizeof(Float32); }
-            break;
-        case kAudioBooleanControlPropertyValue:
-            if (o == kObjMute) RET(UInt32, atomic_load(&g_vol_mute) ? 1 : 0);
-            break;
-        }
+    }
+    /* The output volume and mute controls */
+    if (vol_is_control(oid)) {
+        UInt32 n = vol_property_size(oid, s);
+        if (n == UINT32_MAX) return kAudioHardwareUnknownPropertyError;
+        *outSize = n;
         return 0;
     }
+    return kAudioHardwareUnknownPropertyError;
+}
+
+static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, UInt32 *outSize, void *outData) {
+    AudioObjectPropertySelector s = addr->mSelector;
+    AudioObjectPropertyScope sc = addr->mScope;
+
+    /* The plug-in object */
+    if (oid == kObjPlugIn) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass: *(AudioClassID*)outData = kAudioObjectClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyClass: *(AudioClassID*)outData = kAudioPlugInClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyOwner: *(AudioObjectID*)outData = kAudioObjectUnknown; *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioObjectPropertyManufacturer: *(CFStringRef*)outData = CFSTR("Rane Corporation"); *outSize = sizeof(CFStringRef); return 0;
+            case kAudioPlugInPropertyResourceBundle: *(CFStringRef*)outData = CFSTR(""); *outSize = sizeof(CFStringRef); return 0;
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioPlugInPropertyDeviceList:
+                if (s == kAudioObjectPropertyOwnedObjects && !owned_class_wanted(qsz, qd, kAudioDeviceClassID)) {
+                    *outSize = 0;
+                } else if (device_published() && inSize >= sizeof(AudioObjectID)) {
+                    *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID);
+                } else {
+                    *outSize = 0;
+                }
+                return 0;
+            case kAudioPlugInPropertyTranslateUIDToDevice: {
+                CFStringRef u = (qd && qsz >= sizeof(CFStringRef)) ? *(CFStringRef*)qd : NULL;
+                *(AudioObjectID*)outData = (device_published() && u && CFEqual(u, CFSTR("com.rane.sl3.hal.device")))
+                                         ? kObjDevice : kAudioObjectUnknown;
+                *outSize = sizeof(AudioObjectID);
+                return 0;
+            }
+        }
+    }
+
+    /* The device, including the SL 3's custom properties */
+    if (oid == kObjDevice) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass: *(AudioClassID*)outData = kAudioObjectClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyClass: *(AudioClassID*)outData = kAudioDeviceClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyOwner: *(AudioObjectID*)outData = kObjPlugIn; *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioObjectPropertyName: *(CFStringRef*)outData = CFSTR("SL 3"); *outSize = sizeof(CFStringRef); return 0;
+            case kAudioObjectPropertyManufacturer: *(CFStringRef*)outData = CFSTR("Rane Corporation"); *outSize = sizeof(CFStringRef); return 0;
+            case kAudioObjectPropertyModelName: *(CFStringRef*)outData = CFSTR("Rane SL 3"); *outSize = sizeof(CFStringRef); return 0;
+            case kAudioDevicePropertyDeviceUID: *(CFStringRef*)outData = CFSTR("com.rane.sl3.hal.device"); *outSize = sizeof(CFStringRef); return 0;
+            case kAudioDevicePropertyModelUID: *(CFStringRef*)outData = CFSTR("com.rane.sl3.hal.model"); *outSize = sizeof(CFStringRef); return 0;
+            case kAudioDevicePropertyTransportType: *(UInt32*)outData = kAudioDeviceTransportTypeUSB; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyRelatedDevices: *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioDevicePropertyClockDomain: *(UInt32*)outData = 0x52414E33; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyDeviceIsAlive: *(UInt32*)outData = device_published() ? 1 : 0; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyDeviceIsRunning: *(UInt32*)outData = (g_io_clients > 0) ? 1 : 0; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+            case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyLatency:
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeOutput) ? out_latency_frames() : IN_DEVICE_LATENCY_FRAMES;
+                *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertySafetyOffset:
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? in_safety_frames() : out_safety_frames();
+                *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyIsHidden: *(UInt32*)outData = 0; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = ZTS_PERIOD_FRAMES; *outSize = sizeof(UInt32); return 0;
+            case kAudioObjectPropertyOwnedObjects: {
+                AudioObjectID ids[DEVICE_NOWNED];
+                UInt32 n = device_owned_objects(sc, qsz, qd, ids);
+                memcpy(outData, ids, n * sizeof(AudioObjectID));
+                *outSize = n * sizeof(AudioObjectID);
+                return 0;
+            }
+            case kAudioDevicePropertyStreams: {
+                AudioObjectID *ids = (AudioObjectID*)outData;
+                if (sc == kAudioObjectPropertyScopeInput) { ids[0] = kObjStreamIn; *outSize = sizeof(AudioObjectID); }
+                else if (sc == kAudioObjectPropertyScopeOutput) { ids[0] = kObjStreamOut; *outSize = sizeof(AudioObjectID); }
+                else { ids[0] = kObjStreamIn; ids[1] = kObjStreamOut; *outSize = 2 * sizeof(AudioObjectID); }
+                return 0;
+            }
+            case kAudioObjectPropertyControlList:
+                memcpy(outData, kControlObjs, sizeof kControlObjs);
+                *outSize = sizeof kControlObjs;
+                return 0;
+            case kAudioDevicePropertyNominalSampleRate: *(Float64*)outData = g_sr; *outSize = sizeof(Float64); return 0;
+            case kAudioDevicePropertyAvailableNominalSampleRates: {
+                AudioValueRange *r = (AudioValueRange*)outData;
+                r[0].mMinimum = 44100.0; r[0].mMaximum = 44100.0;
+                r[1].mMinimum = 48000.0; r[1].mMaximum = 48000.0;
+                *outSize = 2 * sizeof(AudioValueRange);
+                return 0;
+            }
+            case kAudioDevicePropertyPreferredChannelsForStereo: {
+                UInt32 *c = (UInt32*)outData; c[0] = 1; c[1] = 2; *outSize = 2 * sizeof(UInt32); return 0;
+            }
+            case kAudioDevicePropertyPreferredChannelLayout: {
+                AudioChannelLayout *l = (AudioChannelLayout*)outData;
+                l->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
+                l->mChannelBitmap = 0;
+                l->mNumberChannelDescriptions = NCH;
+                for (UInt32 i = 0; i < NCH; i++) {
+                    l->mChannelDescriptions[i].mChannelLabel = kAudioChannelLabel_Discrete_0 + i;
+                    l->mChannelDescriptions[i].mChannelFlags = 0;
+                }
+                *outSize = offsetof(AudioChannelLayout, mChannelDescriptions) + NCH * sizeof(AudioChannelDescription);
+                return 0;
+            }
+            case kAudioObjectPropertyElementName: {
+                /* Rane's labels for the channels (its control panel's channel order); the
+                   descriptors only say "CH1".."CH6". */
+                static CFStringRef const inNames[NCH] = {
+                    CFSTR("Aux In L"), CFSTR("Aux In R"),
+                    CFSTR("Left Deck In L"), CFSTR("Left Deck In R"),
+                    CFSTR("Right Deck In L"), CFSTR("Right Deck In R")
+                };
+                static CFStringRef const outNames[NCH] = {
+                    CFSTR("Aux Out L"), CFSTR("Aux Out R"),
+                    CFSTR("Left Deck Out L"), CFSTR("Left Deck Out R"),
+                    CFSTR("Right Deck Out L"), CFSTR("Right Deck Out R")
+                };
+                UInt32 el = addr->mElement;
+                if (el >= 1 && el <= NCH) {
+                    CFStringRef nm = (sc == kAudioObjectPropertyScopeInput) ? inNames[el-1] : outNames[el-1];
+                    CFRetain(nm);
+                    *(CFStringRef*)outData = nm;
+                } else {
+                    *(CFStringRef*)outData = CFSTR("");
+                }
+                *outSize = sizeof(CFStringRef);
+                return 0;
+            }
+            case kAudioObjectPropertyCustomPropertyInfoList: {
+                /* Declares the custom properties so the HAL marshals them to clients
+                   (Sl3Api.framework, sl3panel). Without this, clients get 'who?'. */
+                static const AudioServerPlugInCustomPropertyInfo all[5] = {
+                    { kSL3PropHIDCommand, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL3PropStatus,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL3PropUnsolQueue, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL3PropMeters,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL3PropInSafety,   kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                };
+                UInt32 n = inSize / sizeof(AudioServerPlugInCustomPropertyInfo);
+                if (n > 5) n = 5;
+                memcpy(outData, all, n * sizeof(AudioServerPlugInCustomPropertyInfo));
+                *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
+                return 0;
+            }
+            case kSL3PropHIDCommand: {
+                /* The reply to this client's last 'sl3h' write (sent then), once; never sends. */
+                uint8_t reply[HID_REPORT_LEN] = {0};
+                /* Take this client's pending reply, if any (all zeros if none). */
+                pthread_mutex_lock(&g_mutex);
+                for (int i = 0; i < HID_CLIENTS; i++)
+                    if (g_hid_replies[i].used && g_hid_replies[i].pid == pid && g_hid_replies[i].pending) {
+                        memcpy(reply, g_hid_replies[i].reply, HID_REPORT_LEN);
+                        g_hid_replies[i].pending = false;
+                    }
+                pthread_mutex_unlock(&g_mutex);
+                /* Return it as a new CFData, which the caller releases. */
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, reply, HID_REPORT_LEN);
+                *outSize = sizeof(CFDataRef);
+                return 0;
+            }
+            case kSL3PropStatus: {
+                /* The status packet: fill in the live fields (the HID code keeps the rest up to
+                   date), then return a copy as CFData. */
+                pthread_mutex_lock(&g_mutex);
+                ST_LOCK();
+                g_st.connected = atomic_load(&g_hw_connected) ? 1 : 0;
+                g_st.streaming = atomic_load(&g_io_running) ? 1 : 0;
+                g_st.sample_rate = (uint32_t)g_sr;
+                g_st.cap_frames = atomic_load(&g_total_cap_frames);
+                g_st.play_frames = atomic_load(&g_total_play_frames);
+                g_st.boot_mode = atomic_load(&g_boot_mode) ? 1 : 0;
+                g_st.debug_build = SL3_DEBUG ? 1 : 0;
+                g_st.in_safety_us = (uint32_t)atomic_load(&g_in_safety_us);
+                g_st.early_read = atomic_load(&g_early_state);
+                g_st.hub_depth = atomic_load(&g_hub_depth);
+                g_st.in_dropouts = atomic_load(&g_in_dropouts);
+                SL3StatusPacket copy = g_st;
+                ST_UNLOCK();
+                pthread_mutex_unlock(&g_mutex);
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&copy, sizeof(copy));
+                *outSize = sizeof(CFDataRef);
+                return 0;
+            }
+            case kSL3PropInSafety: {
+                /* The input safety offset setting, in us (the status says what the HAL is using). */
+                int us = atomic_load(&g_in_safety_set_us);
+                *(CFNumberRef*)outData = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &us);
+                *outSize = sizeof(CFNumberRef);
+                return 0;
+            }
+            case kSL3PropMeters: {
+                /* The peaks since the last read, each reset as it is taken; reading also keeps the
+                   meters running for another METER_IDLE_MS. */
+                Float32 v[2 * NCH];
+                meter_take(pid, v);
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)v, sizeof v);
+                *outSize = sizeof(CFDataRef);
+                return 0;
+            }
+            case kSL3PropUnsolQueue: {
+                /* This client's reports since its last read, oldest first. */
+                pthread_mutex_lock(&g_unsol_mtx);
+                /* Its read position; if it fell over UNSOL_Q_MAX behind, skip to the oldest kept. */
+                uint64_t *r = unsol_cursor(pid);
+                if (g_unsol_w - *r > UNSOL_Q_MAX) *r = g_unsol_w - UNSOL_Q_MAX;
+                /* Copy every report from there to the newest, moving its position past them. */
+                CFMutableDataRef md = CFDataCreateMutable(kCFAllocatorDefault, (CFIndex)(g_unsol_w - *r) * HID_REPORT_LEN);
+                for (; *r < g_unsol_w; (*r)++) CFDataAppendBytes(md, g_unsol_q[*r % UNSOL_Q_MAX], HID_REPORT_LEN);
+                pthread_mutex_unlock(&g_unsol_mtx);
+                *(CFDataRef*)outData = md;
+                *outSize = sizeof(CFDataRef);
+                return 0;
+            }
+        }
+    }
+
+    /* The input and output streams */
+    if (oid == kObjStreamIn || oid == kObjStreamOut) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass: *(AudioClassID*)outData = kAudioObjectClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyClass: *(AudioClassID*)outData = kAudioStreamClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyOwner: *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioObjectPropertyName:
+                *(CFStringRef*)outData = (oid == kObjStreamIn) ? CFSTR("SL 3 Input Stream") : CFSTR("SL 3 Output Stream");
+                *outSize = sizeof(CFStringRef); return 0;
+            case kAudioStreamPropertyIsActive: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
+            case kAudioStreamPropertyDirection: *(UInt32*)outData = (oid == kObjStreamIn) ? 1 : 0; *outSize = sizeof(UInt32); return 0;
+            case kAudioStreamPropertyTerminalType:
+                *(UInt32*)outData = (oid == kObjStreamIn) ? kAudioStreamTerminalTypeLine : kAudioStreamTerminalTypeSpeaker;
+                *outSize = sizeof(UInt32); return 0;
+            case kAudioStreamPropertyStartingChannel: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
+            case kAudioStreamPropertyLatency:
+                /* Clients add device and stream latency. With 32 frames on the output stream and
+                   none on the input, the device's total (output latency + 32 out, 44 in: 142 frames
+                   at 44.1 kHz, 148 at 48 kHz) matches the round trip measured through a loopback
+                   cable (rtlat: 138-139 and 143-146 frames), slightly over rather than under. */
+                *(UInt32*)outData = (oid == kObjStreamOut) ? 32 : 0;
+                *outSize = sizeof(UInt32); return 0;
+            case kAudioStreamPropertyVirtualFormat:
+            case kAudioStreamPropertyPhysicalFormat:
+                fill_asbd((AudioStreamBasicDescription*)outData, g_sr);
+                *outSize = sizeof(AudioStreamBasicDescription);
+                return 0;
+            case kAudioStreamPropertyAvailableVirtualFormats:
+            case kAudioStreamPropertyAvailablePhysicalFormats: {
+                AudioStreamRangedDescription *rd = (AudioStreamRangedDescription*)outData;
+                fill_asbd(&rd[0].mFormat, 44100.0);
+                rd[0].mSampleRateRange.mMinimum = 44100.0; rd[0].mSampleRateRange.mMaximum = 44100.0;
+                fill_asbd(&rd[1].mFormat, 48000.0);
+                rd[1].mSampleRateRange.mMinimum = 48000.0; rd[1].mSampleRateRange.mMaximum = 48000.0;
+                *outSize = 2 * sizeof(AudioStreamRangedDescription);
+                return 0;
+            }
+        }
+    }
+    /* The output volume and mute controls */
+    if (vol_is_control(oid)) return vol_get_property(oid, s, inSize, outSize, outData);
+    return kAudioHardwareUnknownPropertyError;
+}
+
+/* The size of one element of an array-valued property, or 0 if the property is a single value. */
+static UInt32 property_element_size(AudioObjectPropertySelector s) {
+    switch (s) {
+        case kAudioObjectPropertyOwnedObjects:
+        case kAudioPlugInPropertyDeviceList:
+        case kAudioDevicePropertyStreams:
+        case kAudioDevicePropertyRelatedDevices:
+        case kAudioObjectPropertyControlList:                 return sizeof(AudioObjectID);
+        case kAudioDevicePropertyAvailableNominalSampleRates: return sizeof(AudioValueRange);
+        case kAudioDevicePropertyPreferredChannelsForStereo:  return sizeof(UInt32);
+        case kAudioStreamPropertyAvailableVirtualFormats:
+        case kAudioStreamPropertyAvailablePhysicalFormats:    return sizeof(AudioStreamRangedDescription);
+        case kAudioObjectPropertyCustomPropertyInfoList:      return sizeof(AudioServerPlugInCustomPropertyInfo);
     }
     return 0;
-    #undef RET
 }
 
-/* Properties that exist with an empty value. */
-static int prop_empty(AudioObjectID o, const AudioObjectPropertyAddress *a) {
-    return (o == kObjPlugIn && a->mSelector == kAudioPlugInPropertyBoxList) ||
-           (o == kObjPlugIn && !g_visible && (a->mSelector == kAudioObjectPropertyOwnedObjects || a->mSelector == kAudioPlugInPropertyDeviceList)) ||
-           ((o == kObjStreamIn || o == kObjStreamOut || vol_is_control(o)) && a->mSelector == kAudioObjectPropertyOwnedObjects);
+/* GetPropertyData: never write past the caller's buffer (inSize). A buffer big enough for the whole
+   property gets it; a smaller one gets as many whole elements of an array as fit; a single value
+   that doesn't fit is an error. */
+static OSStatus SL3_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, UInt32 *outSize, void *outData) {
+    if (!addr || !outSize || !outData) return kAudioHardwareIllegalOperationError;
+
+    /* How much the property needs, and the common case: the buffer is big enough. */
+    UInt32 need = 0;
+    OSStatus st = SL3_GetPropertyDataSize(d, oid, pid, addr, qsz, qd, &need);
+    if (st) return st;
+    if (inSize >= need) return get_property_data(d, oid, pid, addr, qsz, qd, inSize, outSize, outData);
+
+    /* Too small: produce the whole array in a scratch buffer and copy the elements that fit. */
+    UInt32 elem = property_element_size(addr->mSelector);
+    uint8_t tmp[1024];
+    if (!elem || need > sizeof tmp) return kAudioHardwareBadPropertySizeError;
+    UInt32 got = 0;
+    st = get_property_data(d, oid, pid, addr, qsz, qd, need, &got, tmp);
+    if (st) return st;
+    UInt32 n = (inSize / elem) * elem;
+    if (n > got) n = got;
+    memcpy(outData, tmp, n);
+    *outSize = n;
+    return 0;
 }
 
-/* kAudioObjectPropertyOwnedObjects, filtered by the qualifier's class IDs:
- * an object matches if its class or base class is listed. Returns the count. */
-static UInt32 owned(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, AudioObjectID *ids) {
-    AudioObjectID all[16];
-    UInt32 n = prop(o, a, NULL, all) / sizeof(AudioObjectID), k = 0;
-    for (UInt32 i = 0; i < n; i++) {
-        AudioObjectID id = all[i];
-        AudioClassID cls = id == kObjDevice ? kAudioDeviceClassID
-                         : (id == kObjStreamIn || id == kObjStreamOut) ? kAudioStreamClassID
-                         : id == kObjMute ? kAudioMuteControlClassID : kAudioVolumeControlClassID;
-        AudioClassID bcls = (id == kObjDevice || id == kObjStreamIn || id == kObjStreamOut) ? kAudioObjectClassID
-                          : id == kObjMute ? kAudioBooleanControlClassID : kAudioLevelControlClassID;
-        int ok = !q || qs < sizeof(AudioClassID);
-        for (UInt32 j = 0; !ok && j < qs / sizeof(AudioClassID); j++) {
-            AudioClassID c = ((const AudioClassID *)q)[j];
-            ok = c == cls || c == bcls || c == kAudioControlClassID || c == kAudioObjectClassID;
-        }
-        if (ok) ids[k++] = id;
+#if SL3_DEBUG
+/* 'sl3h' debug commands. Each takes its argument from byte [5] onwards:
+     0xF3 <ms hi> <lo> hold the USB queue this long, once, as a completion stall would
+     0xF4 <n>          treat the next n capture packets as errored
+     0xF5 <0|1>        1: the early reader places nothing, as on a Mac where it can't work */
+static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
+    /* Every command needs at least its first argument byte, [5]. */
+    if (len < 6) return kAudioHardwareBadPropertySizeError;
+    switch (c[0]) {
+        case SL3_CMD_DBG_STALL:
+            if (len < 7) return kAudioHardwareBadPropertySizeError;
+            atomic_store(&dbg_stall_ms, ((uint32_t)c[5] << 8) | c[6]);
+            DBG_LOG("DBG next capture completion stalls the USB queue for %u ms", atomic_load(&dbg_stall_ms));
+            return 0;
+        case SL3_CMD_DBG_ERRPKTS:
+            atomic_store(&dbg_err_pkts, c[5]);
+            DBG_LOG("DBG next %u capture packets treated as errored", c[5]);
+            return 0;
+        case SL3_CMD_DBG_NOEARLY:
+            atomic_store(&dbg_no_early, c[5] != 0);
+            DBG_LOG("DBG early capture read %{public}s", c[5] ? "off" : "on");
+            return 0;
     }
-    return k;
+    return kAudioHardwareIllegalOperationError;
 }
-static int is_owned(AudioObjectID o, const AudioObjectPropertyAddress *a) {
-    return a->mSelector == kAudioObjectPropertyOwnedObjects && (o == kObjPlugIn || o == kObjDevice);
-}
+#endif
 
-static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a) {
-    (void)d; (void)pid;
-    if (a->mSelector == kAudioPlugInPropertyTranslateUIDToDevice) return o == kObjPlugIn;
-    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropMeters)) return true;
-    return prop_empty(o, a) || prop(o, a, NULL, NULL) > 0;
-}
-static OSStatus IsSettable(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, Boolean *s) {
-    if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    int v = vol_index(o);
-    *s = (o == kObjDevice && (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kSL3PropStatus)) ||
-         ((o == kObjStreamIn || o == kObjStreamOut) &&
-          (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat)) ||
-         (v >= 0 && (a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue)) ||
-         (o == kObjMute && a->mSelector == kAudioBooleanControlPropertyValue);
-    return noErr;
-}
-static OSStatus GetSize(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz) {
-    if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    if (o == kObjDevice && (a->mSelector == kSL3PropHIDRequest || a->mSelector == kSL3PropStatus || a->mSelector == kSL3PropMeters)) { *sz = sizeof(CFPropertyListRef); return noErr; }
-    AudioObjectID ids[16];
-    *sz = prop_empty(o, a) ? 0 : is_owned(o, a) ? owned(o, a, qs, q, ids) * (UInt32)sizeof(AudioObjectID) : prop(o, a, q, NULL);
-    return noErr;
-}
-static OSStatus GetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 in, UInt32 *out, void *data) {
-    if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    if (o == kObjDevice && a->mSelector == kSL3PropHIDRequest) {
-        if (qs < sizeof(CFPropertyListRef) || !q || in < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
-        CFPropertyListRef qpl = *(const CFPropertyListRef *)q;
-        if (!qpl || CFGetTypeID(qpl) != CFDataGetTypeID()) return kAudioHardwareBadPropertySizeError;
-        CFDataRef qd = (CFDataRef)qpl;
-        CFIndex qlen = CFDataGetLength(qd);
-        const uint8_t *req = CFDataGetBytePtr(qd);
-        if (qlen < 2) return kAudioHardwareBadPropertySizeError;
-        uint8_t cmd = req[0], len = req[1];
-        if (len > HID_REPORT - 5 || qlen < 2 + len) return kAudioHardwareBadPropertySizeError;
-        uint8_t reply[HID_REPORT];
-        if (hid_request(cmd, req + 2, len, reply) != 0) return kAudioHardwareNotRunningError;
-        *(CFDataRef *)data = CFDataCreate(NULL, reply, HID_REPORT);
-        *out = sizeof(CFPropertyListRef);
-        return noErr;
+static OSStatus SL3_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, const void *inData) {
+    /* 'sl3i': the input safety offset setting, in us (IN_SAFETY_MIN_US to IN_SAFETY_MAX_US). The HAL
+       reads safety offsets only when it sets the device up, so it changes only with nothing
+       streaming: refused otherwise. The setting is kept, and the device set up again with it; the next
+       stream judges the early read afresh. */
+    if (oid == kObjDevice && addr->mSelector == kSL3PropInSafety) {
+        if (inSize != sizeof(CFNumberRef) || !inData) return kAudioHardwareBadPropertySizeError;
+        CFNumberRef n = *(CFNumberRef*)inData;
+        int us = 0;
+        if (!n || CFGetTypeID(n) != CFNumberGetTypeID() || !CFNumberGetValue(n, kCFNumberIntType, &us) ||
+            us < IN_SAFETY_MIN_US || us > IN_SAFETY_MAX_US) return kAudioHardwareIllegalOperationError;
+        if (atomic_load(&g_io_running)) return kAudioHardwareIllegalOperationError;
+        atomic_store(&g_in_safety_set_us, us);
+        atomic_store(&g_early_state, EARLY_UNKNOWN);
+        in_safety_save();
+        LOG("Input safety offset setting: %.1f ms", us / 1000.0);
+        relist_if_safety_changed();
+        return 0;
     }
-    if (o == kObjDevice && a->mSelector == kSL3PropMeters) {
-        if (in < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
-        Float32 peaks[2 * NCH];
-        for (int i = 0; i < 2 * NCH; i++)
-            peaks[i] = atomic_exchange_explicit(&g_meter_peaks[i], 0.0f, memory_order_relaxed);
-        *(CFDataRef *)data = CFDataCreate(NULL, (const UInt8 *)peaks, sizeof(peaks));
-        *out = sizeof(CFPropertyListRef);
-        return noErr;
-    }
-    if (o == kObjDevice && a->mSelector == kSL3PropStatus) {
-        if (in < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
-        int pres = atomic_load(&g_present);
-        if (pres && !g_hid) {
-            uint8_t dummy[HID_REPORT];
-            hid_request(0x32, NULL, 0, dummy);
-        }
-        g_st.present = (uint32_t)pres;
-        g_st.is_c0 = 0;
-        *(CFDataRef *)data = CFDataCreate(NULL, (const UInt8 *)&g_st, sizeof(sl3_hal_status_t));
-        *out = sizeof(CFPropertyListRef);
-        return noErr;
-    }
-    if (prop_empty(o, a)) { *out = 0; return noErr; }
-    if (is_owned(o, a)) {
-        AudioObjectID ids[16];
-        UInt32 n = owned(o, a, qs, q, ids);
-        if (n > in / sizeof(AudioObjectID)) n = in / sizeof(AudioObjectID);
-        memcpy(data, ids, n * sizeof(AudioObjectID));
-        *out = n * (UInt32)sizeof(AudioObjectID);
-        return noErr;
-    }
-    UInt32 need = prop(o, a, q, NULL);
-    /* list properties may be asked for fewer items than they have */
-    int list = a->mSelector == kAudioObjectPropertyOwnedObjects || a->mSelector == kAudioDevicePropertyStreams ||
-               a->mSelector == kAudioObjectPropertyControlList || a->mSelector == kAudioPlugInPropertyDeviceList;
-    if (in < need) {
-        if (!list) return kAudioHardwareBadPropertySizeError;
-        uint8_t tmp[128];
-        prop(o, a, q, tmp);
-        *out = in / sizeof(AudioObjectID) * sizeof(AudioObjectID);
-        memcpy(data, tmp, *out);
-        return noErr;
-    }
-    *out = prop(o, a, q, data);
-    return noErr;
-}
-static OSStatus SetData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 sz, const void *data) {
-    (void)qs; (void)q; (void)sz; (void)data;
-    if (!HasProperty(d, o, pid, a)) return kAudioHardwareUnknownPropertyError;
-    if (vol_is_control(o)) {
-        int v = vol_index(o);
-        if (v >= 0 && (a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue)) {
-            if (!data || sz < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
-            Float32 x = *(const Float32 *)data;
-            if (!isfinite(x)) return kAudioHardwareIllegalOperationError;
-            pthread_mutex_lock(&g_vol_mtx);
-            float db = (a->mSelector == kAudioLevelControlPropertyScalarValue) ? vol_scalar_to_db(x)
-                     : (x < VOL_MIN_DB ? VOL_MIN_DB : x > VOL_MAX_DB ? VOL_MAX_DB : x);
-            bool changed = db != atomic_load(&g_vol_db[v]);
-            atomic_store(&g_vol_db[v], db);
-            if (changed) vol_update_gain();
-            pthread_mutex_unlock(&g_vol_mtx);
-            if (changed && g_host) {
-                AudioObjectPropertyAddress va[2] = {
-                    { kAudioLevelControlPropertyScalarValue,  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
-                    { kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
-                };
-                g_host->PropertiesChanged(g_host, o, 2, va);
+    /* 'sl3h': a client's HID command for the box (a CFData report); its reply is kept for the
+       client's next read of 'sl3h'. */
+    if (oid == kObjDevice && addr->mSelector == kSL3PropHIDCommand) {
+        if (inSize == sizeof(CFDataRef) && inData) {
+            CFDataRef cd = *(CFDataRef*)inData;
+            /* Debug commands (SL3_CMD_DEBUG_FIRST and up) are handled by the driver, never sent to the box. */
+            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 1 &&
+                CFDataGetBytePtr(cd)[0] >= SL3_CMD_DEBUG_FIRST) {
+#if SL3_DEBUG
+                return dbg_command(CFDataGetBytePtr(cd), CFDataGetLength(cd));
+#else
+                return kAudioHardwareIllegalOperationError;
+#endif
             }
-            return noErr;
-        }
-        if (o == kObjMute && a->mSelector == kAudioBooleanControlPropertyValue) {
-            if (!data || sz < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-            bool m = *(const UInt32 *)data != 0;
-            pthread_mutex_lock(&g_vol_mtx);
-            bool changed = m != atomic_load(&g_vol_mute);
-            atomic_store(&g_vol_mute, m);
-            if (changed) vol_update_gain();
-            pthread_mutex_unlock(&g_vol_mtx);
-            if (changed && g_host) {
-                AudioObjectPropertyAddress ma = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-                g_host->PropertiesChanged(g_host, kObjMute, 1, &ma);
+            /* A box command: copy it into a full-length, zero-padded report. */
+            if (!cd || CFGetTypeID(cd) != CFDataGetTypeID() || CFDataGetLength(cd) < 1 ||
+                CFDataGetLength(cd) > HID_REPORT_LEN) return kAudioHardwareBadPropertySizeError;
+            uint8_t req[HID_REPORT_LEN] = {0};
+            memcpy(req, CFDataGetBytePtr(cd), (size_t)CFDataGetLength(cd));
+            uint8_t reply[HID_REPORT_LEN] = {0};
+            bool answered;
+
+            /* A rate change (0x31) to the other supported rate goes through the HAL's handshake
+               (PerformDeviceConfigurationChange sends it to the box), so the HAL's rate and the box's
+               change together; the client gets the box's usual reply. Anything else, including the
+               current rate or an invalid one (which the box rejects), goes to the box now. */
+            int sr = (req[5] << 8) | req[6];
+            if (req[0] == SL3_CMD_SET_RATE && (sr == 44100 || sr == 48000) && (Float64)sr != g_sr && g_host) {
+                OSStatus st = g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)sr, NULL);
+                if (st) return st;
+                reply[0] = SL3_CMD_SET_RATE;
+                memcpy(reply + 1, req + 1, 4);
+                answered = true;
+            } else {
+                pthread_mutex_lock(&g_mutex);
+                answered = usb_ensure_hid() && hid_cmd(req[0], req + 5, HID_MAX_ARGS, reply, req + 1);
+                /* A client's 0x33 that sets an output source: the status follows it (firmware 2.31
+                   sends no 0x39 report; 2.50's report updates it again). */
+                if (answered && req[0] == SL3_CMD_SET_CONTROLS) {
+                    for (int d = 0; d < SL3_NDECKS; d++) {
+                        int idx = SL3_CTL_SOURCE_AT(d), at = idx - req[5];
+                        if (at >= 0 && at < req[6] && idx < SL3_CONTROLS_LEN - 1 && req[7 + at] <= 1) {
+                            ST_LOCK(); g_st.thru[d] = req[7 + at] ? 0 : 1; ST_UNLOCK();
+                            g_routing_known[d] = req[7 + at];   /* the client's choice: the settle check keeps it */
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&g_mutex);
+                if (reply[0] == SL3_REJECTED) answered = true;   /* the client sees the rejection */
             }
-            return noErr;
+
+            /* Keep the reply for this client's next read of 'sl3h', in its own slot or else the
+               slot used least recently. */
+            pthread_mutex_lock(&g_mutex);
+            int slot = 0;
+            for (int i = 0; i < HID_CLIENTS; i++) {
+                if (g_hid_replies[i].used && g_hid_replies[i].pid == pid) { slot = i; break; }
+                if (!g_hid_replies[i].used || g_hid_replies[i].last < g_hid_replies[slot].last) slot = i;
+            }
+            g_hid_replies[slot] = (HidClientReply){ .used = true, .pending = true, .pid = pid, .last = mach_absolute_time() };
+            memcpy(g_hid_replies[slot].reply, reply, HID_REPORT_LEN);
+            pthread_mutex_unlock(&g_mutex);
+            return answered ? 0 : kAudioHardwareUnspecifiedError;
         }
-        return kAudioHardwareUnsupportedOperationError;
+        return kAudioHardwareBadPropertySizeError;
     }
-    if (o == kObjDevice && a->mSelector == kSL3PropStatus) {
-        if (sz < sizeof(CFPropertyListRef) || !data) return kAudioHardwareBadPropertySizeError;
-        CFPropertyListRef pl = *(const CFPropertyListRef *)data;
-        if (!pl || CFGetTypeID(pl) != CFDataGetTypeID() || CFDataGetLength((CFDataRef)pl) < (CFIndex)sizeof(uint32_t))
-            return kAudioHardwareBadPropertySizeError;
-        uint32_t ms = 0;
-        memcpy(&ms, CFDataGetBytePtr((CFDataRef)pl), sizeof(uint32_t));
-        if (ms >= 1 && ms <= 50) g_st.buffer_ms = ms;
-        return noErr;
+    /* A new rate, set on the device or through a stream's format: ask the HAL to change it. */
+    if (oid == kObjDevice && addr->mSelector == kAudioDevicePropertyNominalSampleRate) {
+        if (inSize < sizeof(Float64) || !inData) return kAudioHardwareBadPropertySizeError;
+        return request_sample_rate(*(const Float64*)inData);
     }
-    double want = 0;
-    if (o == kObjDevice && a->mSelector == kAudioDevicePropertyNominalSampleRate) {
-        if (sz < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
-        want = *(const Float64 *)data;
-    } else if ((o == kObjStreamIn || o == kObjStreamOut) &&
-               (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
-        if (sz < sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
-        AudioStreamBasicDescription f = *(const AudioStreamBasicDescription *)data, ref = format_at(f.mSampleRate);
-        if (memcmp(&f, &ref, sizeof f)) return kAudioDeviceUnsupportedFormatError;
-        want = f.mSampleRate;
-    } else return kAudioHardwareUnsupportedOperationError;
-    if (want != 44100 && want != 48000) return kAudioDeviceUnsupportedFormatError;
-    if (want == RATE) {
-        if (g_present) {
-            uint8_t rp[2] = {(uint8_t)((int)want >> 8), (uint8_t)(int)want}, reply[HID_REPORT];
-            hid_request(0x31, rp, 2, reply);
-        }
-        return noErr;
+    if ((oid == kObjStreamIn || oid == kObjStreamOut) &&
+        (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
+        if (inSize < sizeof(AudioStreamBasicDescription) || !inData) return kAudioHardwareBadPropertySizeError;
+        return request_sample_rate(((const AudioStreamBasicDescription*)inData)->mSampleRate);
     }
-    /* the host stops IO and calls PerformDeviceConfigurationChange */
-    return g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)want, NULL);
+    /* The output volume and mute controls */
+    if (vol_is_control(oid)) return vol_set_property(oid, addr->mSelector, inSize, inData);
+    return kAudioHardwareUnsupportedOperationError;
 }
 
-/* kAudioDevicePropertyDeviceIsRunning is tracked by the HAL, which calls
- * StartIO/StopIO: the plug-in must not report it changed from inside them
- * (doing so left coreaudiod spinning in proxy reconciliation). */
-static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c) {
-    (void)d; (void)c;
-    if (o != kObjDevice) return kAudioHardwareBadObjectError;
-    pthread_mutex_lock(&g_lock);
-    OSStatus r = noErr;
-    if (g_io_clients == 0) {
-        if (usb_open_all()) r = kAudioHardwareNotRunningError;
-        else g_io_clients = 1;
-    } else g_io_clients++;
-    pthread_mutex_unlock(&g_lock);
-    return r;
-}
-static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c) {
-    (void)d; (void)c;
-    if (o != kObjDevice) return kAudioHardwareBadObjectError;
-    pthread_mutex_lock(&g_lock);
-    int last = g_io_clients == 1;
-    if (g_io_clients > 0) g_io_clients--;
-    if (last) usb_close(g_present);
-    pthread_mutex_unlock(&g_lock);
-    /* the box went while running: hide the device now IO is over, later and
-     * from our own queue rather than inside StopIO */
-    if (last && !g_present && g_nq)
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), g_nq, ^{ update_visibility(); });
-    return noErr;
+static OSStatus SL3_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid) {
+    /* The first client starts the stream; if the box can't be opened, the client gets an error
+       rather than silence on a timeline with no box behind it. */
+    pthread_mutex_lock(&g_mutex);
+    /* No IO is running yet, so a new stream starts at the current gain rather than ramping from
+       the level the last one ended at. */
+    if (g_io_clients >= IO_CLIENTS_MAX) {
+        pthread_mutex_unlock(&g_mutex);
+        LOG("StartIO refused: %d clients already running", IO_CLIENTS_MAX);
+        return kAudioHardwareUnspecifiedError;
+    }
+    if (g_io_clients == 0) vol_snap();
+    if (g_io_clients == 0 && !usb_open_all()) {
+        pthread_mutex_unlock(&g_mutex);
+        LOG("StartIO failed: the SL 3 could not be opened");
+        return kAudioHardwareNotRunningError;
+    }
+    /* Count the client, by its ID; StopIO stops the stream when the last one leaves. */
+    g_io_cids[g_io_clients++] = cid;
+    pthread_mutex_unlock(&g_mutex);
+    return 0;
 }
 
-static OSStatus ZeroTS(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c, Float64 *st, UInt64 *ht, UInt64 *seed) {
-    (void)d; (void)c;
-    if (o != kObjDevice) return kAudioHardwareBadObjectError;
-    double a_s, a_h, tpf; uint64_t sd; int v;
-    clk_read(&a_s, &a_h, &tpf, &sd, &v);
-    if (!v) { *st = 0; *ht = mach_absolute_time(); *seed = 1; return noErr; }
-    double now_s = a_s + ((double)mach_absolute_time() - a_h) / tpf;
-    double k = floor(now_s / ZTS_PERIOD) * ZTS_PERIOD;
-    *st = k;
-    *ht = (UInt64)llround(a_h + (k - a_s) * tpf);
-    *seed = sd;
-    return noErr;
+static OSStatus SL3_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid) {
+    /* The last client stops the stream and puts the decks back on analogue thru. A client not
+       counted is one whose session ended with an unplug (on_usb_removed clears the clients): its
+       StopIO, however late, mustn't stop a stream started since the replug. */
+    pthread_mutex_lock(&g_mutex);
+    int at = -1;
+    for (UInt32 i = 0; i < g_io_clients; i++) if (g_io_cids[i] == cid) { at = (int)i; break; }
+    if (at >= 0) {
+        g_io_cids[at] = g_io_cids[--g_io_clients];
+        if (g_io_clients == 0) usb_stop_streaming(true);
+    } else {
+        LOG("StopIO from a client not running (its session ended when the box was unplugged)");
+    }
+    pthread_mutex_unlock(&g_mutex);
+    return 0;
 }
 
-static OSStatus WillDo(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c, UInt32 op, Boolean *w, Boolean *ip) {
-    (void)d; (void)o; (void)c;
-    *w = op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationWriteMix;
-    *ip = true;
-    return noErr;
+/* The latest period boundary on the timeline (see g_clk_*) at or before now, and its host time.
+   Every answer lies on the same line, so the HAL never sees a timestamp out of line. */
+static OSStatus SL3_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, Float64 *outSampleTime, UInt64 *outHostTime, UInt64 *outSeed) {
+    /* The timeline position now. */
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    double pos = s + ((double)mach_absolute_time() - (double)h) / tpf;
+    double period = pos > 0 ? floor(pos / ZTS_PERIOD_FRAMES) * ZTS_PERIOD_FRAMES : 0;   /* latest period boundary */
+
+    /* That boundary, its host time on the line, and the seed (changed when the timeline restarts). */
+    *outSampleTime = period;
+    *outHostTime   = (uint64_t)((double)h + (period - s) * tpf);
+    *outSeed       = atomic_load(&g_zts_seed);
+    return 0;
 }
-static OSStatus BeginOp(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c, UInt32 op, UInt32 n, const AudioServerPlugInIOCycleInfo *i) { (void)d; (void)o; (void)c; (void)op; (void)n; (void)i; return noErr; }
-static OSStatus DoOp(AudioServerPlugInDriverRef d, AudioObjectID o, AudioObjectID s, UInt32 c, UInt32 op, UInt32 n,
-                     const AudioServerPlugInIOCycleInfo *ci, void *main, void *sec) {
-    (void)d; (void)o; (void)s; (void)c; (void)sec;
-    float *buf = main;
+
+static OSStatus SL3_WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, Boolean *outWillDo, Boolean *outIsInPlace) {
+    *outIsInPlace = true;
+    /* ProcessMix applies the output volume to the mix, in place, just before WriteMix (see
+       vol_process_mix). */
+    *outWillDo = (op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationProcessMix ||
+                  op == kAudioServerPlugInIOOperationWriteMix);
+    return 0;
+}
+
+static OSStatus SL3_BeginIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci) { return 0; }
+
+static OSStatus SL3_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, AudioObjectID sid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci, void *ioMain, void *ioSec) {
+    float *buf = (float*)ioMain;
+    /* ReadInput: from the capture ring, at the HAL's input sample time. */
     if (op == kAudioServerPlugInIOOperationReadInput) {
-        uint64_t t = (uint64_t)llround(ci->mInputTime.mSampleTime);
-        if (g_in_next && t != g_in_next) S.in_jumps++;
-        g_in_next = t + n;
-        long miss = 0;
-        for (UInt32 f = 0; f < n; f++) miss += !sring_get(&g_in, t + f, buf + f * NCH);
-        if (miss) S.in_miss += miss;
-    } else if (op == kAudioServerPlugInIOOperationWriteMix) {
-        uint64_t t = (uint64_t)llround(ci->mOutputTime.mSampleTime);
-        if (g_out_next && t != g_out_next) S.out_jumps++;
-        g_out_next = t + n;
-        for (UInt32 f = 0; f < n; f++) {
-            float fr[NCH];
-            memcpy(fr, buf + f * NCH, sizeof(float) * NCH);
-            vol_apply_frame(fr);
-            meter_update(NCH, fr);
-            sring_put(&g_out, t + f, fr);
-            if (atomic_load_explicit(&g_dp_active, memory_order_relaxed)) {
-                atomic_fetch_add_explicit(&g_dp_writers, 1, memory_order_acquire);
-                if (atomic_load_explicit(&g_dp_active, memory_order_relaxed))
-                    dp_write_frame(t + f, fr);
-                atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
-            }
-            for (int c = 0; c < NCH; c++) { float a = fabsf(fr[c]); if (a > g_pk_hal[c]) g_pk_hal[c] = a; }
+        /* Copy each frame from the capture ring, or silence where capture has not written yet (it
+           is later than the input safety offset, or the box is gone) or wrote too long ago. */
+        uint64_t pos = (uint64_t)ci->mInputTime.mSampleTime;
+        /* First the packets that have arrived since the last completion (see "Early read"). */
+        cap_read_early();
+        uint64_t done_head = atomic_load_explicit(&g_cap_head, memory_order_acquire);
+        uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);
+        uint64_t head = early_head > done_head ? early_head : done_head;
+        /* After the first capture: count what ReadInput asked for, and the cycles it had to fill with
+           silence because the frames weren't captured in time. */
+        if (done_head) {
+            if (SL3_DEBUG || !atomic_load_explicit(&g_er_judged, memory_order_relaxed))
+                atomic_fetch_add_explicit(&g_rd_frames, frames, memory_order_relaxed);
+            if (pos + frames > head) atomic_fetch_add_explicit(&g_in_dropouts, 1, memory_order_relaxed);
         }
+#if SL3_DEBUG
+        if (done_head) {   /* how much the early read gave, and the margin */
+            uint64_t end = pos + frames;
+            if (end > done_head) {
+                uint64_t from = pos > done_head ? pos : done_head;
+                uint64_t upto = end < head ? end : head;
+                if (upto > from) atomic_fetch_add_explicit(&dbg_rd_early, upto - from, memory_order_relaxed);
+            }
+            if (end > head) atomic_fetch_add_explicit(&dbg_rd_short, end - (pos > head ? pos : head), memory_order_relaxed);
+            int64_t margin = (int64_t)head - (int64_t)end;
+            if (margin < atomic_load_explicit(&dbg_rd_margin_min, memory_order_relaxed))
+                atomic_store_explicit(&dbg_rd_margin_min, margin, memory_order_relaxed);
+        }
+#endif
+        for (UInt32 f = 0; f < frames; f++) {
+            uint64_t p = pos + f;
+            if (p >= head || head - p > CAP_VALID_SPAN) {
+                memset(buf + f * NCH, 0, NCH * sizeof(float));
+                continue;
+            }
+            memcpy(buf + f * NCH, &g_in_ring[(p & RING_MASK) * NCH], NCH * sizeof(float));
+        }
+
+        /* ProcessMix: the mix of all clients, before WriteMix: apply the output volume. */
+    } else if (op == kAudioServerPlugInIOOperationProcessMix) {
+        if (sid == kObjStreamOut && buf) {
+            vol_process_mix(buf, frames);
+            if (meter_active()) meter_frames(NCH, buf, frames);
+        }
+
+        /* WriteMix: into the deep schedule's queued transfers, at the HAL's output sample time. */
+    } else if (op == kAudioServerPlugInIOOperationWriteMix) {
+        uint64_t pos = (uint64_t)ci->mOutputTime.mSampleTime;
+        /* Register as a writer before checking g_dp_active, so dp_stop either sees this call
+           or this call sees the schedule switched off. */
+        int writers = atomic_fetch_add_explicit(&g_dp_writers, 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&g_dp_active, memory_order_seq_cst)) {
+#if SL3_DEBUG
+            {   /* WriteMix calling pattern: with several clients the HAL calls it from more than one
+                   IO thread, but never concurrently and never for a position already written (each
+                   call carries the full mix; these counters check that), which is what lets
+                   dp_write overwrite rather than mix */
+                uint64_t tid = (uint64_t)pthread_mach_thread_np(pthread_self());
+                if (atomic_exchange_explicit(&dbg_wm_last_thread, tid, memory_order_relaxed) != tid)
+                    atomic_fetch_add_explicit(&dbg_wm_thread_switches, 1, memory_order_relaxed);
+                if (writers > 0) atomic_fetch_add_explicit(&dbg_wm_concurrent, 1, memory_order_relaxed);
+                uint64_t hi = atomic_load_explicit(&dbg_wm_high, memory_order_relaxed);
+                if (pos < hi) {
+                    uint64_t over = hi - pos;
+                    atomic_fetch_add_explicit(&dbg_wm_rewritten, (uint32_t)(over < frames ? over : frames), memory_order_relaxed);
+                }
+                if (pos + frames > hi) atomic_store_explicit(&dbg_wm_high, pos + frames, memory_order_relaxed);
+            }
+#else
+            (void)writers;
+#endif
+            dp_write(buf, frames, pos);
+            atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
+            return 0;
+        }
+        /* The schedule is off (not started yet, or stopping): the mix is dropped. */
+        atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
     }
-    return noErr;
+    return 0;
 }
-static OSStatus EndOp(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 c, UInt32 op, UInt32 n, const AudioServerPlugInIOCycleInfo *i) { (void)d; (void)o; (void)c; (void)op; (void)n; (void)i; return noErr; }
 
-static AudioServerPlugInDriverInterface g_iface = {
-    NULL, QI, AddRef, Release, Initialize, CreateDevice, DestroyDevice, AddClient, RemoveClient,
-    PerformCfg, AbortCfg, HasProperty, IsSettable, GetSize, GetData, SetData,
-    StartIO, StopIO, ZeroTS, WillDo, BeginOp, DoOp, EndOp
+static OSStatus SL3_EndIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci) { return 0; }
+
+static AudioServerPlugInDriverInterface g_interface = {
+    NULL,
+    SL3_QueryInterface,
+    SL3_AddRef,
+    SL3_Release,
+    SL3_Initialize,
+    SL3_CreateDevice,
+    SL3_DestroyDevice,
+    SL3_AddDeviceClient,
+    SL3_RemoveDeviceClient,
+    SL3_PerformDeviceConfigurationChange,
+    SL3_AbortDeviceConfigurationChange,
+    SL3_HasProperty,
+    SL3_IsPropertySettable,
+    SL3_GetPropertyDataSize,
+    SL3_GetPropertyData,
+    SL3_SetPropertyData,
+    SL3_StartIO,
+    SL3_StopIO,
+    SL3_GetZeroTimeStamp,
+    SL3_WillDoIOOperation,
+    SL3_BeginIOOperation,
+    SL3_DoIOOperation,
+    SL3_EndIOOperation
 };
-static AudioServerPlugInDriverInterface *g_ifacep = &g_iface;
 
-static HRESULT QI(void *d, REFIID iid, LPVOID *out) {
-    CFUUIDRef req = CFUUIDCreateFromUUIDBytes(NULL, iid);
-    Boolean ok = CFEqual(req, IUnknownUUID) || CFEqual(req, kAudioServerPlugInDriverInterfaceUUID);
-    CFRelease(req);
-    if (!ok) { *out = NULL; return E_NOINTERFACE; }
-    AddRef(d);
-    *out = &g_ifacep;
-    return S_OK;
-}
+static AudioServerPlugInDriverInterface *g_driver_ptr = &g_interface;
 
 __attribute__((visibility("default")))
-void *SL3Device_Create(CFAllocatorRef alloc, CFUUIDRef type) {
-    (void)alloc;
-    g_log = os_log_create("sl3.device", "driver");
-    if (!CFEqual(type, kAudioServerPlugInTypeUUID)) return NULL;
-    return &g_ifacep;
+void* SL3Device_Create(CFAllocatorRef allocator, CFUUIDRef requestedTypeUUID) {
+    if (CFEqual(requestedTypeUUID, kAudioServerPlugInTypeUUID)) {
+        return &g_driver_ptr;
+    }
+    return NULL;
 }

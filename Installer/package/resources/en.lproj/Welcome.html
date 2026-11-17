@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; font-size: 13px; line-height: 1.5; margin: 12px 16px; }
+  .header { display: flex; align-items: center; margin-bottom: 14px; }
+  h1 { font-size: 20px; margin: 0 0 4px 0; font-weight: 700; }
+  .sub { font-size: 13px; opacity: 0.85; margin: 0; }
+  .credits { border-left: 4px solid #ffd600; padding: 10px 14px; margin: 14px 0; border-radius: 6px; background: rgba(255, 214, 0, 0.12); }
+  a { color: #007aff; text-decoration: none; font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #f5f5f7; }
+    a { color: #ffd600; }
+  }
+  ul { padding-left: 20px; margin: 8px 0; }
+  li { margin-bottom: 5px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1>Rane SL3 CoreAudio Driver</h1>
+      <p class="sub">Version @VERSION@ &bull; Native for Apple Silicon (M1 / M2 / M3 / M4) &amp; Intel</p>
+    </div>
+  </div>
+  <div class="credits">
+    <strong>Original idea and project by:</strong> pepelee (PPLEE)<br/>
+    <strong>Instagram:</strong> <a href="https://www.instagram.com/pepeleedj/">@pepeleedj</a> &mdash; <code>instagram.com/pepeleedj/</code>
+  </div>
+  <p>This installer sets up the low-latency driver for the <strong>Rane SL3</strong> audio interface on your Mac:</p>
+  <ul>
+    <li><strong>6 inputs and 6 outputs</strong> (Aux, Left Deck and Right Deck) at 24-bit / 44.1 or 48 kHz, with a low-latency audio engine.</li>
+    <li><strong>Automatic USB / Thru switching</strong> when you open and close your audio software (Ableton Live, Traktor, Mixxx, Serato, Logic Pro, etc.).</li>
+    <li><strong>SL 3 Control Panel app</strong> (in Applications) and the <code>sl3panel</code> utility: each deck's Phono/Line switch, Thru, phono sensitivity, volume and levels.</li>
+    <li><strong>Serato DJ Pro 2.5.5</strong>: includes <code>Sl3Api.framework</code> (DVS modes ABS / REL / INT and THRU).</li>
+    <li><strong>Works straight away:</strong> no restart needed, and no need to turn off System Integrity Protection (SIP).</li>
+  </ul>
+</body>
+</html>
