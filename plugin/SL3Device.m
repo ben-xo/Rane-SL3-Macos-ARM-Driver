@@ -420,6 +420,10 @@ static dispatch_semaphore_t g_hid_sem;
 static _Atomic bool g_waiting = false;
 static uint8_t  g_wait_cmd = 0;
 static uint32_t g_wait_seq = 0;
+/* Guards the hand-off of a reply: hid_read matches, copies and signals under it, and hid_cmd sets
+   up and gives up its wait under it, so a reply matched to one command can't be signalled after the
+   next one has started waiting. */
+static pthread_mutex_t g_reply_mtx = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t  g_reply_buf[HID_REPORT_LEN];
 static SL3StatusPacket g_st;
 /* g_st's box-state fields are written from the USB queue (reports), the hot-plug queue and client
@@ -533,6 +537,7 @@ static void hid_read(void) {
 
             /* The awaited reply: its command (or a rejection) with its tag. (The box's own reports
                have opcodes no command uses, so a tag can't make one look like a reply.) */
+            pthread_mutex_lock(&g_reply_mtx);
             bool reply = atomic_load(&g_waiting) && rseq == g_wait_seq &&
                          (b[0] == g_wait_cmd || b[0] == SL3_REJECTED);
             if (reply) {
@@ -540,10 +545,12 @@ static void hid_read(void) {
                 memcpy(g_reply_buf, b, HID_REPORT_LEN);
                 atomic_store(&g_waiting, false);
                 dispatch_semaphore_signal(g_hid_sem);
+            }
+            pthread_mutex_unlock(&g_reply_mtx);
 
             /* An unsolicited report: note the switches, thru and overload state, and queue it
                for clients. */
-            } else if (b[0] == SL3_REPORT_OVERLOAD || b[0] == SL3_REPORT_PHONO || b[0] == SL3_REPORT_THRU) {
+            if (!reply && (b[0] == SL3_REPORT_OVERLOAD || b[0] == SL3_REPORT_PHONO || b[0] == SL3_REPORT_THRU)) {
                 note_report(b);
                 unsol_push(b);
             }
@@ -586,9 +593,11 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     memcpy(buf + 1, &seq, 4);
     if (pl && plen > 0) memcpy(buf + 5, pl, plen > HID_MAX_ARGS ? HID_MAX_ARGS : plen);
     bool wait = cmd != SL3_CMD_NO_REPLY;
+    pthread_mutex_lock(&g_reply_mtx);
     g_wait_cmd = cmd;
     g_wait_seq = seq;
     atomic_store(&g_waiting, wait);
+    pthread_mutex_unlock(&g_reply_mtx);
 
     /* Send it. */
     NSMutableData *d = [NSMutableData dataWithBytes:buf length:HID_REPORT_LEN];
@@ -598,7 +607,9 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     BOOL ok = [g_hpipe_out sendIORequestWithData:d bytesTransferred:&sent completionTimeout:0 error:&e];
     pthread_mutex_unlock(&g_hout_mtx);
     if (!ok) {
+        pthread_mutex_lock(&g_reply_mtx);
         atomic_store(&g_waiting, false);
+        pthread_mutex_unlock(&g_reply_mtx);
         pthread_mutex_unlock(&g_hid_mtx);
         return false;
     }
@@ -606,12 +617,19 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     /* Wait for the reply. */
     bool accepted = true;
     if (wait) {
-        if (dispatch_semaphore_wait(g_hid_sem, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC)) == 0) {
+        bool got = dispatch_semaphore_wait(g_hid_sem, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC)) == 0;
+        if (!got) {
+            /* No reply in time: stop waiting, so hid_read doesn't take a late one as the answer,
+               unless it handed one over as the wait ran out (then take it). */
+            pthread_mutex_lock(&g_reply_mtx);
+            if (atomic_load(&g_waiting)) atomic_store(&g_waiting, false);
+            else got = dispatch_semaphore_wait(g_hid_sem, DISPATCH_TIME_NOW) == 0;
+            pthread_mutex_unlock(&g_reply_mtx);
+        }
+        if (got) {
             if (reply_out) memcpy(reply_out, g_reply_buf, HID_REPORT_LEN);
             accepted = g_reply_buf[0] != SL3_REJECTED;
         } else {
-            /* No reply in time: stop waiting, so hid_read doesn't take a late one as the answer. */
-            atomic_store(&g_waiting, false);
             accepted = false;
             if (reply_out) memset(reply_out, 0, HID_REPORT_LEN);
         }

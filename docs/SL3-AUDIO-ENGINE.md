@@ -566,6 +566,14 @@ setting or early read (44), and the heartbeat below.
     - Fix: every write of `g_st` and the getter's copy are made under `g_st_lock` (an `os_unfair_lock`,
       held only for the copy, never across a HID command); the getter returns its copy.
     - Test: `make hwtest` (status reads throughout, `sl3apitest`); the tear itself is too narrow to hit.
+23. **A reply arriving as a command timed out could be taken by the next command.**
+    - Cause: `hid_read` matched a reply (by command and sequence number), then copied it and signalled
+      `hid_cmd` as separate steps. If the command timed out between the match and the signal, the signal
+      could land after the next command had cleared old signals, and that command returned the stale reply
+      and discarded its own. Found in a code review.
+    - Fix: the match, copy and signal, and `hid_cmd`'s setting up and giving up of its wait, are made under
+      one lock (`g_reply_mtx`); a reply handed over as the wait runs out is taken rather than dropped.
+    - Test: `make hwtest` (every command); the window is too narrow to hit on purpose.
 
 ## Testing
 
