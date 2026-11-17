@@ -8,3 +8,5 @@
 *.o
 *.dSYM/
 .DS_Store
+/sl3dump
+/sl3flash
