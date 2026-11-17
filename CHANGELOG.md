@@ -60,6 +60,12 @@ SL 3 with firmware 2.31 and 2.50 (debug build; the release build's box-only test
 - The channel order in the instructions: 1–2 Aux, 3–4 Left deck, 5–6 Right deck.
 - `install-sl3.sh` installs the driver's `Info.plist` with its binary, so the bundle's version is the
   installed driver's.
+- From a code review (none seen on the hardware): playback switched off again before its buffers are freed
+  at a stop; a box replugged before its removal was handled is closed and reopened; HID reads retry after a
+  refused enqueue and back off after errors; a box reply can't reach the next command after a timeout; the
+  status packet is copied consistently; a stale StopIO from before an unplug can't stop a new stream; a rate
+  change while streaming sends the rate once; Sl3Api doesn't wait 2 s per call with a box with no firmware;
+  one definition of the status packet (`plugin/SL3Status.h`).
 
 ## [1.3.0] - 2026-11-10
 
