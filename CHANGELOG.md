@@ -66,6 +66,10 @@ SL 3 with firmware 2.31 and 2.50 (debug build; the release build's box-only test
   status packet is copied consistently; a stale StopIO from before an unplug can't stop a new stream; a rate
   change while streaming sends the rate once; Sl3Api doesn't wait 2 s per call with a box with no firmware;
   one definition of the status packet (`plugin/SL3Status.h`).
+- From the SL 2's 1.4.1: a second unplug soon after a replug no longer leaves the decks on thru at the next
+  replug; the settle check keeps a routing a client chose instead of putting every deck back on thru; the
+  box's configuration is reset only when another driver holds its HID interface; boot mode after a removal
+  comes from the open box; `sl3flash` refuses `--dry-run` with `--backup-only`; hwtest reads `SL_LOOP_CH`.
 
 ## [1.3.0] - 2026-11-10
 
