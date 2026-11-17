@@ -4,8 +4,10 @@ All notable changes to the Rane SL3 macOS ARM Driver project are documented in t
 
 ## [Unreleased]
 
-The SL 2 driver's work (pepeleedj/Rane-SL2-Macos-ARM-Driver v1.3.0) ported to the SL 3. Not yet tested
-on SL 3 hardware: see "Still open" in `docs/SL3-AUDIO-ENGINE.md`.
+The SL 2 driver's work (pepeleedj/Rane-SL2-Macos-ARM-Driver v1.3.0) ported to the SL 3, and tested on an
+SL 3 with firmware 2.31 and 2.50 (debug build): `make hwtest ARGS="--loopback"` 24 of 24; Serato DJ Pro
+2.5.5 with turntables; Serato DJ Pro 4.x / 5.x. An 8.5 ms DVS round trip at Serato's
+1 ms (48-frame) buffer. What is still open is listed in `docs/SL3-AUDIO-ENGINE.md`.
 
 ### Added
 - **The SL 2 driver's low-latency engine** in `SL3Device.driver`: deep-scheduled late-write playback,
@@ -14,11 +16,17 @@ on SL 3 hardware: see "Still open" in `docs/SL3-AUDIO-ENGINE.md`.
   setting (`sl3panel safety`), stream teardown on the USB queue, and a debug build (`make plugin DEBUG=1`)
   with test hooks (`sl3dbg`).
 - **Output volume and mute**, master and per channel (6), in the driver.
+- **Settle check:** thru and the sample rate are set again 2 s after the box is opened and 4 s after the
+  Mac wakes, as firmware 2.31's DSP boot (after configuration and after every USB suspend) puts the decks
+  on USB audio and the rate at 44.1 kHz. Confirmed after a Mac sleep.
+- **Routing kept across a replug mid-stream:** the decks come back as they were, so Serato keeps their
+  modes (they came back in THRU, sending timecode to the mixer); thru if no stream restarts within 5 s.
 - **SL 3 Control Panel.app** (macOS 13+): each deck's LINE/PHONO switch, thru and phono sensitivity,
-  level meters, overload flags, output volume, sample rate and input safety offset.
+  level meters (with a note to choose the SL 3 as input while nothing streams), overload flags, output
+  volume, sample rate, input safety offset, and the firmware version in red when older than 2.50.
 - **Firmware tools** (`tools/firmware/`): `extract-sl3-firmware.py` (from Rane's `RaneSL3_2.0.1f2.pkg`),
-  `sl3flash` (over USB, with a backup first and verification before the EEPROM is marked bootable; not
-  yet run on an SL 3), and `sl3dump` (EEPROM backup and verify).
+  `sl3flash` (over USB, with a backup first and verification before the EEPROM is marked bootable; used to
+  update an SL 3 from 2.31 to 2.50), and `sl3dump` (EEPROM backup and verify).
 - **Tests:** `make hwtest` (the hardware tests in one run), `tools/latency/` (round-trip latency and
   glitch tests), `sl3apitest` (Sl3Api as Serato DJ Pro 2.5.5 calls it).
 - **`make package`**: the installer package and zip built from source, with no Rane binaries.
@@ -30,10 +38,12 @@ on SL 3 hardware: see "Still open" in `docs/SL3-AUDIO-ENGINE.md`.
   callbacks from the box's reports).
 - `sl3panel` works through the driver, so it works while the driver runs.
 - 48 kHz by default (Rane's default, and Serato's for the SL 3); the chosen rate is remembered.
+- The reported latency measured on the SL 3 (input device latency 44 frames).
+- `sl3panel status` shows the box's own sample rate beside the driver's.
 - Device UID `com.rane.sl3.hal.device` (the HAL's saved settings for the old UID don't carry over).
 
 ### Removed
-- The 0x37 heartbeat: the SL 3's firmware doesn't check it.
+- The 0x37 heartbeat: the SL 3's firmware doesn't check it (confirmed on 2.31 and 2.50).
 - Rane's "SL 3 Audio Control Panel" System Settings pane from the installer (the app replaces it).
 - The OpenSL3 bridge (`sl3bridge`) and its diagnostic tools.
 
