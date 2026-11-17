@@ -466,6 +466,17 @@ setting or early read (44), and the heartbeat below.
     - Fix: the frame's last byte (its last sample's top byte) decides. Found in review. `0d6cf1b`.
 11. **Sl3Api deadlocked if a callback called back into it** (callbacks ran with its lock held).
     - Fix: callbacks are called outside the lock. Found in review. `10edc3d`.
+12. **After a Mac sleep the decks were on USB audio and the box at 44.1 kHz** (firmware 2.31's DSP boot).
+    - Fix: the settle check, 2 s after connect and 4 s after a wake. Confirmed on the box. `79078e6`.
+    - Test: `make hwtest`, "thru and rate after the Mac sleeps".
+13. **After a replug mid-stream, Serato DJ Pro 2.5.5 put every deck in THRU.**
+    - Cause: the driver put every deck on thru at connect; Serato, reconnecting by itself, read the output
+      sources before restarting its stream and adopted thru (timecode to the mixer).
+    - Fix: the routing at an unplug while streaming is restored at connect and at the next stream start
+      (box back within 30 s; thru if no stream within 5 s). Confirmed with Serato: the decks stay in REL.
+      `5fd6505`.
+14. **The status kept a deck's old thru state when a client switched it** (2.31 has no `0x39` report).
+    - Fix: the driver's status follows a client's accepted `0x33`. `43bc298`.
 
 ## Testing
 
