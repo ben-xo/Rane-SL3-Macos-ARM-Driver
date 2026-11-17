@@ -6,7 +6,7 @@ CFLAGS = -fobjc-arc -O2 -mmacosx-version-min=12.0 -DSL3_VERSION=\"$(VERSION)\"
 # (tools/latency/bin/sl3dbg: test hooks); make install DEBUG=1 also installs it
 PLUGIN_DEFS = $(if $(DEBUG),-DSL3_DEBUG=1)
 
-all: plugin api panel dump flash
+all: plugin api panel dump flash controlpanel
 
 plugin:
 	$(CC) $(ARCH) -bundle $(CFLAGS) $(PLUGIN_DEFS) -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost plugin/SL3Device.m -o SL3Device
@@ -28,6 +28,10 @@ dump:
 
 flash:
 	$(CC) $(ARCH) $(CFLAGS) -Itools -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost tools/firmware/sl3flash.m tools/SL3Passthrough.m -o sl3flash
+
+# SL 3 Control Panel.app (SwiftUI, universal), in the repository root
+controlpanel:
+	tools/controlpanel/build-app.sh
 
 # sl3apitest: checks Sl3Api as Serato DJ Pro 2.5.5 uses it (run the x86_64 slice with arch -x86_64)
 apitest:
@@ -51,6 +55,6 @@ hwtest: panel apitest latency
 
 clean:
 	rm -f SL3Device Sl3Api sl3panel sl3apitest sl3dump sl3flash
-	rm -rf tools/latency/bin
+	rm -rf tools/latency/bin "SL 3 Control Panel.app" build
 
-.PHONY: all plugin install api panel dump flash apitest latency hwtest clean
+.PHONY: all plugin install api panel dump flash controlpanel apitest latency hwtest clean
