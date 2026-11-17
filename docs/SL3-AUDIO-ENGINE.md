@@ -437,6 +437,16 @@ setting or early read (44), and the heartbeat below.
      connect.
    - Fix: boot mode kept; nothing sent to the loader at connect; no streaming from it.
    - Found by reading the code.
+8. **A box that didn't answer `0x01` kept the previous box's version** (so the box back from a flash
+   could be taken for the loader, or the loader for the firmware).
+   - Fix: the version and USB state are cleared before the box is asked. Found in review. `6134cba`.
+9. **An unplug elsewhere cleared the loader's boot mode** (boot mode after a removal came only from boxes
+   with no strings).
+   - Fix: a removal keeps boot mode if the attached box's version is the loader's. Found in review. `7449d64`.
+10. **The early read could take a frame whose last sample was part-written.**
+    - Fix: the frame's last byte (its last sample's top byte) decides. Found in review. `0d6cf1b`.
+11. **Sl3Api deadlocked if a callback called back into it** (callbacks ran with its lock held).
+    - Fix: callbacks are called outside the lock. Found in review. `10edc3d`.
 
 ## Testing
 
