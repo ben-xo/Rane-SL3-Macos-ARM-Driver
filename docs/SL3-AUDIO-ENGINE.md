@@ -373,6 +373,14 @@ keys would move only channels 1–2, the Aux deck.
   `log stream --level debug --predicate 'subsystem == "com.rane.sl3api"'`.
 - `sl3apitest` (`make apitest`) loads the framework from Serato's path and checks the seven calls as Serato
   makes them. Run it as `arch -x86_64 ./sl3apitest` (Serato 2.5.5 is Intel-only) as well as natively.
+- **Tested with Serato DJ Pro 2.5.5** and three turntables with control vinyl, on an SL 3 with firmware 2.31
+  (2026-11-17): the box is recognised with all three decks; the hardware check passes (Serato opens the
+  library, checks the port status, sends the challenge, then opens a second handle, registers its thru
+  callback and reads each deck's output source); REL and ABS follow the records on every deck; thru per
+  deck; the 1 ms USB buffer (48 frames, an 8.5 ms DVS round trip); timecode at −9 to −11 dBFS on every
+  input; a replug with Serato open is picked up again with the decks in their mode (§ bug catalogue 13);
+  quitting Serato puts every deck back on thru. During one 5-minute session one millisecond of capture was
+  missed (filled with silence, one 3-frame input dropout), during a burst of `0x34` overload reports.
 
 ## Platform facts worth knowing
 
@@ -560,5 +568,8 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
 - **The overload flags**: which six signals they are.
 - **The firmware tools** (`tools/firmware/`) have not been run on an SL 3.
 - **Serato DJ Pro 4.x / 5.x**: untested.
+- **One missed millisecond of capture with Serato** (see §8): whether the box's overload reports, about 30 a
+  second while a flag toggles, can delay the capture completions on the shared USB queue. The overload
+  flags' mapping to channels is also unknown.
 - The output side (2 ms safety offset + 1.5 ms output latency) is set by the 1 ms write guard and 1 ms
   transfers; shorter transfers or a smaller guard might save up to ~1 ms. Untested on either box.
