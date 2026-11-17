@@ -8,6 +8,7 @@
 #define OP_VERSION       0x01
 #define OP_WRITE         0x02
 #define OP_READ          0x03
+#define OP_GET_RATE      0x30   /* reply [5..6] the box's rate, big-endian */
 #define OP_GET_CONTROLS  0x32
 #define OP_SET_CONTROLS  0x33
 
@@ -52,6 +53,13 @@ bool sl3h_version(AudioObjectID dev, uint8_t *major, uint8_t *minor) {
     if (!sl3h_command(dev, req, reply)) return false;
     *major = reply[5];
     *minor = reply[6];
+    return true;
+}
+
+bool sl3h_get_rate(AudioObjectID dev, unsigned *hz) {
+    uint8_t req[SL3_REPORT] = { OP_GET_RATE }, reply[SL3_REPORT];
+    if (!sl3h_command(dev, req, reply)) return false;
+    *hz = (unsigned)(reply[5] << 8 | reply[6]);
     return true;
 }
 

@@ -33,6 +33,10 @@ bool sl3h_command(AudioObjectID dev, uint8_t req[SL3_REPORT], uint8_t reply[SL3_
    Rane's RAM-loaded EEPROM writer). */
 bool sl3h_version(AudioObjectID dev, uint8_t *major, uint8_t *minor);
 
+/* Command 0x30: the box's own sample rate (its clock, which can differ from the driver's if the box
+   has reset it), in Hz. */
+bool sl3h_get_rate(AudioObjectID dev, unsigned *hz);
+
 /* Command 0x32: the 22 control bytes. */
 bool sl3h_get_controls(AudioObjectID dev, uint8_t out[SL3_CONTROLS_LEN]);
 
