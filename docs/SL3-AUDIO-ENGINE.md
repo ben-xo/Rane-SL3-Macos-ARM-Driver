@@ -562,12 +562,13 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
   step for it (skipped while something holds a PreventSystemSleep assertion, as Internet Sharing does).
 - **Still to confirm on the hardware:** the settle check after a slow DSP boot at connect; the right-hand
   channels (2, 4, 6) carrying audio; how a box with no firmware enumerates; firmware 2.50 (the box tested
-  runs 2.31); the firmware tools; Serato DJ Pro 2.5.5 with turntables; Serato 4.x / 5.x.
+  runs 2.31); the firmware tools.
 - **Control bytes 4–7 of each deck's block** are passed to the DSP with unknown meaning (two 0–127 values at
   96, two flags at 0). One of them may be a level.
 - **The overload flags**: which six signals they are.
 - **The firmware tools** (`tools/firmware/`) have not been run on an SL 3.
-- **Serato DJ Pro 4.x / 5.x**: untested.
+- **Serato DJ Pro 4.x / 5.x**: works (tested by hand on an SL 3
+  with firmware 2.31, 2026-11-17; Serato uses the driver directly, not Sl3Api).
 - **One missed millisecond of capture with Serato** (see §8): whether the box's overload reports, about 30 a
   second while a flag toggles, can delay the capture completions on the shared USB queue. The overload
   flags' mapping to channels is also unknown.
