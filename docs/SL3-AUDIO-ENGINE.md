@@ -560,9 +560,11 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
   after the wake the driver logged "a deck was on USB audio with nothing streaming: back to thru" and "the
   box was at 44100 Hz: set to 48000 Hz", as the 2.31 firmware's DSP boot predicts. `make hwtest` has a
   step for it (skipped while something holds a PreventSystemSleep assertion, as Internet Sharing does).
+- **Firmware 2.50**: the box tested was updated from 2.31 with `sl3flash` (verified against Rane's image,
+  phono sensitivities kept); on 2.50 the box-only tests pass and the `0x39` thru report arrives.
 - **Still to confirm on the hardware:** the settle check after a slow DSP boot at connect; the right-hand
-  channels (2, 4, 6) carrying audio; how a box with no firmware enumerates; firmware 2.50 (the box tested
-  runs 2.31); the firmware tools.
+  channels (2, 4, 6) carrying audio; how a box with no firmware enumerates (and `sl3flash`'s bootstrap
+  path); the loopback tests and a Mac sleep on firmware 2.50.
 - **Control bytes 4–7 of each deck's block** are passed to the DSP with unknown meaning (two 0–127 values at
   96, two flags at 0). One of them may be a level.
 - **The overload flags**: which six signals they are.

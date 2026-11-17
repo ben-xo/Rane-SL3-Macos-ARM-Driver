@@ -385,6 +385,9 @@ The `0x38` report follows each deck's switch, without debouncing: a switch can r
 half a second as it moves, and flipping one switch made its neighbour (the deck before it: Aux for Left,
 Left for Right) read PHONO for about 0.2 s; every reading settled to the switch's position.
 
+The same box updated to 2.50 with `sl3flash`: `0x01` answers `02 32`, and a client's change of a deck's
+output source is confirmed with a `0x39` report (six reports for six changes in `sl3apitest`).
+
 ### Corrections to earlier notes on this box
 
 The OpenSL3 project's protocol notes (this repository's `docs/PROTOCOL.md` until this document

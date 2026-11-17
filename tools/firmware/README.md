@@ -31,11 +31,13 @@ it is power-cycled, and running `sl3flash` again finishes the job.
 
 The protocol is in `docs/SL3-COMMANDS.md` ("Firmware storage and boot", and the ⚠ commands).
 
-**Not yet tested on hardware.** Neither path has been run on an SL 3. The SL 2's equivalent
-(`sl2flash`) was proven on its hardware for both paths, and the SL 3's firmware implements the same
-commands with the same layout, but test with a SOIC-8 clip and a programmer at hand: a box that no
-longer enumerates at all can only be recovered by writing the EEPROM chip directly (from
-`eeprom-image-sl3.bin`, or from the backup `sl3flash` saved).
+**Tested on hardware: updating a running box.** An SL 3 was updated from firmware 2.31 to 2.50
+(2026-11-17): backup saved, 454 blocks written and checked, the image read back and matched, `0x16`,
+the box back answering 2.50; `sl3dump --verify` then matched Rane's image, and the phono sensitivities
+were kept. **Not tested: a box with no firmware** (the bootstrap path), which only an interrupted update
+produces. Keep a SOIC-8 clip and a programmer at hand: a box that no longer enumerates at all can only be
+recovered by writing the EEPROM chip directly (from `eeprom-image-sl3.bin`, or from the backup `sl3flash`
+saved).
 
 ## Usage
 
