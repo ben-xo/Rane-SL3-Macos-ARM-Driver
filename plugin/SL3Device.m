@@ -36,7 +36,7 @@
 #include <math.h>
 
 #ifndef SL3_VERSION
-#define SL3_VERSION  "1.3.0"
+#define SL3_VERSION  "1.4.0"
 #endif
 #define VID          0x1cc5
 #define PID          0x0001

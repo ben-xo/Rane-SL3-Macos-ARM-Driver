@@ -2,7 +2,7 @@
 
 All notable changes to the Rane SL3 macOS ARM Driver project are documented in this file.
 
-## [Unreleased]
+## [1.4.0] — 2026-11-17
 
 The SL 2 driver's work (pepeleedj/Rane-SL2-Macos-ARM-Driver v1.3.0) ported to the SL 3, and tested on an
 SL 3 with firmware 2.31 and 2.50 (debug build; the release build's box-only tests and a glitch test too):
@@ -27,7 +27,8 @@ SL 3 with firmware 2.31 and 2.50 (debug build; the release build's box-only test
   volume, sample rate, input safety offset, and the firmware version in red when older than 2.50.
 - **Firmware tools** (`tools/firmware/`): `extract-sl3-firmware.py` (from Rane's `RaneSL3_2.0.1f2.pkg`),
   `sl3flash` (over USB, with a backup first and verification before the EEPROM is marked bootable; used to
-  update an SL 3 from 2.31 to 2.50), and `sl3dump` (EEPROM backup and verify).
+  update an SL 3 from 2.31 to 2.50; it won't write older firmware than the box runs without `--force`,
+  and `--backup-only` saves the EEPROM without writing), and `sl3dump` (EEPROM backup and verify).
 - **Tests:** `make hwtest` (the hardware tests in one run), `tools/latency/` (round-trip latency and
   glitch tests), `sl3apitest` (Sl3Api as Serato DJ Pro 2.5.5 calls it).
 - **`make package`**: the installer package and zip built from source, with no Rane binaries.
@@ -42,6 +43,11 @@ SL 3 with firmware 2.31 and 2.50 (debug build; the release build's box-only test
 - The reported latency measured on the SL 3 (input device latency 44 frames).
 - `sl3panel status` shows the box's own sample rate beside the driver's.
 - Device UID `com.rane.sl3.hal.device` (the HAL's saved settings for the old UID don't carry over).
+- The early capture read finds arrived frames against a per-position fill template, which audio (even
+  clipped) doesn't match, in place of a single repeated mark byte.
+- The box's interfaces are no longer offered to other drivers, and the driver takes the HID interface
+  back if macOS's HID driver holds it (as after a userspace reboot with the box attached).
+- The installer's background is the control panel's icon, drawn at build time.
 
 ### Removed
 - The 0x37 heartbeat: the SL 3's firmware doesn't check it (confirmed on 2.31 and 2.50).
@@ -52,6 +58,8 @@ SL 3 with firmware 2.31 and 2.50 (debug build; the release build's box-only test
 - `docs/PROTOCOL.md`'s errors, in its replacement `docs/SL3-COMMANDS.md`: `0x17` makes the box unbootable
   (it was listed as a version query); the rate and control bytes reset at power-up.
 - The channel order in the instructions: 1–2 Aux, 3–4 Left deck, 5–6 Right deck.
+- `install-sl3.sh` installs the driver's `Info.plist` with its binary, so the bundle's version is the
+  installed driver's.
 
 ## [1.3.0] - 2026-11-10
 

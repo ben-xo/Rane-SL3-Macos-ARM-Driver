@@ -19,7 +19,7 @@
 #import "SL3Passthrough.h"
 
 #ifndef SL3_VERSION
-#define SL3_VERSION  "1.3.0"
+#define SL3_VERSION  "1.4.0"
 #endif
 #define kSL3PropStatus      'sl3s'
 #define kSL3PropInSafety    'sl3i'
