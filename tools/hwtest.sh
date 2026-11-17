@@ -12,7 +12,7 @@
 #      volume and mute, the level meters, and in a debug build (installed with make install DEBUG=1)
 #      the glitch test under load, the early capture read and the fault hooks;
 #   3. unless --no-physical: steps for a person at the box (flip each deck's LINE/PHONO switch,
-#      unplug and replug while idle and while a stream runs). The script prints what to do and waits
+#      sleep and wake the Mac, unplug and replug while idle and while a stream runs). The script prints what to do and waits
 #      until it sees the change, so nothing needs typing.
 #
 # Exit status 0 = nothing failed. The full output goes to a log file, named at the end.
@@ -433,7 +433,7 @@ echo
 
 echo "== 3. steps at the box"
 if [ $PHYSICAL = 0 ]; then
-    for t in "LINE/PHONO switches reported" "unplug and replug, idle" "volume and mute survive a replug" "unplug and replug, mid-stream"; do
+    for t in "LINE/PHONO switches reported" "thru and rate after the Mac sleeps" "unplug and replug, idle" "volume and mute survive a replug" "unplug and replug, mid-stream"; do
         record SKIP "$t" "--no-physical"
     done
 else
@@ -457,6 +457,34 @@ else
         fi
     done
     [ $ok = 1 ] && record PASS "LINE/PHONO switches reported" "each deck's own" || record FAIL "LINE/PHONO switches reported" "$detail"
+
+    # The Mac sleeping and waking, with nothing playing: the USB suspend powers the box's audio side down
+    # (its yellow light goes off) and its DSP boots again on wake, which on firmware 2.31 puts every deck
+    # on USB audio and the rate at 44.1 kHz. A few seconds after the wake, the driver's settle check must
+    # have put every deck back on thru and the box's own rate back to the driver's. The sleep is seen as
+    # a jump in the wall clock between two half-second polls.
+    if pmset -g assertions 2>/dev/null | grep -qE '^ *PreventSystemSleep +1'; then
+        record SKIP "thru and rate after the Mac sleeps" "something holds a PreventSystemSleep assertion (pmset -g assertions; Internet Sharing does)"
+    else
+        echo "   >>> Put the Mac to sleep (Apple menu > Sleep). Wait about 15 s (the SL 3's yellow light goes off), then wake it."
+        t0=$(date +%s); slept=0
+        for i in $(seq 1 $((WAIT_S * 2))); do
+            sleep 0.5; t1=$(date +%s)
+            if [ $((t1 - t0)) -ge 8 ]; then slept=1; break; fi
+            t0=$t1
+        done
+        if [ $slept = 0 ]; then
+            record FAIL "thru and rate after the Mac sleeps" "no sleep seen within ${WAIT_S} s"
+        else
+            sleep 8   # the driver's settle check runs 4 s after the wake
+            want=$(field 'Sample Rate' | grep -oE '^[0-9]+'); box=$(field 'Box Rate' | grep -oE '^[0-9]+')
+            if all_thru && [ -n "$box" ] && [ "$box" = "$want" ]; then
+                record PASS "thru and rate after the Mac sleeps" "every deck on thru, box at $box Hz"
+            else
+                record FAIL "thru and rate after the Mac sleeps" "thru on $(status | grep -c 'Mode: ANALOG THRU')/3 decks, box at ${box:-?} Hz, driver at ${want:-?} Hz"
+            fi
+        fi
+    fi
 
     # Unplug and replug with nothing playing: the device goes, comes back, and puts every deck on
     # analogue thru. The output volume, set to -20 dB (channels at 0 dB) and muted first, comes back
