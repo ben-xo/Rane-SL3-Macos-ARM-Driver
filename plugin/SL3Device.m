@@ -590,6 +590,8 @@ static void refresh_hw_status(void) {
        minor (02 32 = 2.50), a 32-bit build stamp at reply[7..10]. Rane's RAM-loaded EEPROM writer
        enumerates exactly like the running firmware and answers 02 19 (2.25): that box has no audio. */
     uint8_t r[64];
+    g_st.version_maj = g_st.version_min = 0;   /* not the previous box's, if this one doesn't answer */
+    g_st.usb_state = 0;
     for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be booting its DSP */
         if (hid_cmd(SL3_CMD_VERSION, NULL, 0, r, NULL)) {
             g_st.version_maj = r[5];
