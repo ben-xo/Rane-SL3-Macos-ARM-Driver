@@ -107,6 +107,9 @@ static void print_status(AudioObjectID dev) {
     }
     printf("  Streaming I/O : %s\n", s.streaming ? "ACTIVE" : "IDLE");
     printf("  Sample Rate   : %u Hz\n", s.sample_rate);
+    /* The box's own rate (0x30), which can differ from the driver's if the box has reset it. */
+    uint8_t rq[SL3_REPORT] = { 0x30 }, rr[SL3_REPORT];
+    if (s.connected && sl3h_command(dev, rq, rr)) printf("  Box Rate      : %u Hz\n", (unsigned)(rr[5] << 8 | rr[6]));
     printf("  Firmware Ver  : %u.%02u\n", s.version_maj, s.version_min);
     printf("  USB Link      : %s\n", s.usb_state == 2 ? "high speed" : s.usb_state == 1 ? "FULL SPEED (no audio: use a USB 2.0 port)" : "?");
     /* The phono sensitivities are only in the control block: ask the box. */
