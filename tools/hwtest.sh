@@ -475,17 +475,20 @@ else
     # The Mac sleeping and waking, with nothing playing: the USB suspend powers the box's audio side down
     # (its yellow light goes off) and its DSP boots again on wake, which on firmware 2.31 puts every deck
     # on USB audio and the rate at 44.1 kHz. A few seconds after the wake, the driver's settle check must
-    # have put every deck back on thru and the box's own rate back to the driver's. The sleep is seen as
-    # a jump in the wall clock between two half-second polls.
+    # have put every deck back on thru and the box's own rate back to the driver's. The sleep and the full
+    # wake are read from the power management log (pmset -g log): a short sleep can't be told from the
+    # wall clock, as the Mac runs processes again in a DarkWake a few seconds in, before the user wakes it.
     if pmset -g assertions 2>/dev/null | grep -qE '^ *PreventSystemSleep +1'; then
         record SKIP "thru and rate after the Mac sleeps" "something holds a PreventSystemSleep assertion (pmset -g assertions; Internet Sharing does)"
     else
+        pm_events() { pmset -g log | grep -E '^[0-9-]+ [0-9:]+ [+-][0-9]{4} (Sleep|Wake) {2,}' | cut -c27-31; }
+        sleeps0=$(pm_events | grep -c Sleep)
         echo "   >>> Put the Mac to sleep (Apple menu > Sleep). Wait about 15 s (the SL 3's yellow light goes off), then wake it."
-        t0=$(date +%s); slept=0
-        for i in $(seq 1 $((WAIT_S * 2))); do
-            sleep 0.5; t1=$(date +%s)
-            if [ $((t1 - t0)) -ge 8 ]; then slept=1; break; fi
-            t0=$t1
+        slept=0
+        for i in $(seq 1 $((WAIT_S / 2))); do
+            sleep 2; ev=$(pm_events)
+            # A sleep since the prompt, and the last event since then a full wake.
+            if [ "$(echo "$ev" | grep -c Sleep)" -gt "$sleeps0" ] && [ "$(echo "$ev" | tail -1)" = "Wake " ]; then slept=1; break; fi
         done
         if [ $slept = 0 ]; then
             record FAIL "thru and rate after the Mac sleeps" "no sleep seen within ${WAIT_S} s"
