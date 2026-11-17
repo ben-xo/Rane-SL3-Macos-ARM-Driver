@@ -3110,6 +3110,15 @@ static OSStatus SL3_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             } else {
                 pthread_mutex_lock(&g_mutex);
                 answered = usb_ensure_hid() && hid_cmd(req[0], req + 5, HID_MAX_ARGS, reply, req + 1);
+                /* A client's 0x33 that sets an output source: the status follows it (firmware 2.31
+                   sends no 0x39 report; 2.50's report updates it again). */
+                if (answered && req[0] == SL3_CMD_SET_CONTROLS) {
+                    for (int d = 0; d < SL3_NDECKS; d++) {
+                        int idx = SL3_CTL_SOURCE_AT(d), at = idx - req[5];
+                        if (at >= 0 && at < req[6] && idx < SL3_CONTROLS_LEN - 1 && req[7 + at] <= 1)
+                            g_st.thru[d] = req[7 + at] ? 0 : 1;
+                    }
+                }
                 pthread_mutex_unlock(&g_mutex);
                 if (reply[0] == SL3_REJECTED) answered = true;   /* the client sees the rejection */
             }
