@@ -82,7 +82,6 @@
 
 #define RANE_HDR     0x40     /* header in front of the EEPROM contents in the final image */
 #define IMAGE_LEN    0x38C0   /* EEPROM bytes the final image holds */
-#define BOOTSTRAP_VERSION 0x0219
 
 #define EXIT_WOULD_WRITE 3
 
@@ -409,7 +408,7 @@ int main(int argc, char **argv) {
 
     if (running) {
         release_boxes(b, n);
-        bool loader = (maj << 8 | min) == BOOTSTRAP_VERSION;
+        bool loader = sl3_is_bootstrap(maj, min);
         printf("SL 3 running %s %u.%02u\n", loader ? "Rane's firmware loader (the bootstrap)" : "firmware", maj, min);
     } else {
         printf("SL 3 with no firmware running (%04x:%04x, no strings)\n", b[0].vid, b[0].vid == SL3_VID ? SL3_PID : FX2_DEFAULT_PID);
@@ -439,7 +438,7 @@ int main(int argc, char **argv) {
 
     /* Not over newer firmware: a running box (not the bootstrap, whose version is the loader's) on a
        later version than the image is left alone. */
-    bool bootstrap = (maj << 8 | min) == BOOTSTRAP_VERSION;
+    bool bootstrap = sl3_is_bootstrap(maj, min);
     if (running && !bootstrap && !same && !force && (hdr[0x27] << 8 | hdr[0x28]) < (maj << 8 | min)) {
         printf("the box runs firmware %u.%02u, newer than the image's %u.%02u: not writing it (--force writes it anyway)\n",
                maj, min, hdr[0x27], hdr[0x28]);

@@ -33,6 +33,11 @@ bool sl3h_command(AudioObjectID dev, uint8_t req[SL3_REPORT], uint8_t reply[SL3_
    Rane's RAM-loaded EEPROM writer). */
 bool sl3h_version(AudioObjectID dev, uint8_t *major, uint8_t *minor);
 
+/* The version Rane's RAM-loaded EEPROM writer (the bootstrap) answers: 2.25, where the firmware
+   answers 2.50 (or 2.31 on older boxes). A box running it has no audio. The driver's
+   SL3_BOOTSTRAP_VERSION is the same value. */
+static inline bool sl3_is_bootstrap(uint8_t major, uint8_t minor) { return major == 2 && minor == 25; }
+
 /* Command 0x30: the box's own sample rate (its clock, which can differ from the driver's if the box
    has reset it), in Hz. */
 bool sl3h_get_rate(AudioObjectID dev, unsigned *hz);
