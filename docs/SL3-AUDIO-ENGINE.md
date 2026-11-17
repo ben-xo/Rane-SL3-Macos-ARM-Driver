@@ -506,6 +506,19 @@ setting or early read (44), and the heartbeat below.
       a frame boundary. The debug log counts both off-boundary outcomes.
     - Test: `make hwtest` *(debug)*: "early capture read", "early capture read working"; the debug log's
       "early read" line shows frames placed early and the off-boundary counts.
+16. **macOS's HID driver could take the command interface, leaving the box unusable until a replug.**
+    - Cause: interface 3 is HID-class, and the driver configured the box with its interfaces offered for
+      matching, so macOS's HID driver (`AppleUserUSBHostHIDDevice`) could take it whenever it got there first,
+      as after a userspace reboot with the box attached (matching runs again while coreaudiod is down);
+      every open then failed. Once that driver has used the interface, the box can also drop every command
+      on a new pipe (its EP1 data toggle left at DATA1 against the pipe's DATA0). Found on the SL 2.
+    - Fix: configure with `matchInterfaces:NO`; if the interface is held anyway, set configuration 0 then 1
+      (no matching) once per device opened; clear both EP1 pipes' halt on every open, which resets the
+      toggles. `DeviceSeize` doesn't help (the HID driver refuses it).
+    - Test: a full `make hwtest` (the interfaces now unregistered). The held case: with the driver out of the
+      HAL folder and coreaudiod restarted, configure the box from a tool with `matchInterfaces:YES` (the HID
+      driver attaches to interface 3), put the driver back: "held by another driver: setting the box's
+      configuration again", and the box answers.
 
 ## Testing
 
