@@ -1,6 +1,53 @@
 # Changelog
 
+All notable changes to the Rane SL3 macOS ARM Driver project are documented in this file.
+
 ## [Unreleased]
+
+The SL 2 driver's work (pepeleedj/Rane-SL2-Macos-ARM-Driver v1.3.0) ported to the SL 3. Not yet tested
+on SL 3 hardware: see "Still open" in `docs/SL3-AUDIO-ENGINE.md`.
+
+### Added
+- **The SL 2 driver's low-latency engine** in `SL3Device.driver`: deep-scheduled late-write playback,
+  a timeline that follows the box's clock, capture placed on the timeline with gaps filled, the early
+  capture read (adapted to the SL 3's packed 24-bit samples), input health and the input safety offset
+  setting (`sl3panel safety`), stream teardown on the USB queue, and a debug build (`make plugin DEBUG=1`)
+  with test hooks (`sl3dbg`).
+- **Output volume and mute**, master and per channel (6), in the driver.
+- **SL 3 Control Panel.app** (macOS 13+): each deck's LINE/PHONO switch, thru and phono sensitivity,
+  level meters, overload flags, output volume, sample rate and input safety offset.
+- **Firmware tools** (`tools/firmware/`): `extract-sl3-firmware.py` (from Rane's `RaneSL3_2.0.1f2.pkg`),
+  `sl3flash` (over USB, with a backup first and verification before the EEPROM is marked bootable; not
+  yet run on an SL 3), and `sl3dump` (EEPROM backup and verify).
+- **Tests:** `make hwtest` (the hardware tests in one run), `tools/latency/` (round-trip latency and
+  glitch tests), `sl3apitest` (Sl3Api as Serato DJ Pro 2.5.5 calls it).
+- **`make package`**: the installer package and zip built from source, with no Rane binaries.
+- **Docs:** `docs/SL3-AUDIO-ENGINE.md` (design, bug catalogue), `docs/SL3-COMMANDS.md` (the box's
+  protocol, from its firmware and Rane's driver), `AGENTS.md`.
+
+### Changed
+- `Sl3Api.framework` matches Rane's 2.0.1f2 export for export (handles, return codes, signatures,
+  callbacks from the box's reports).
+- `sl3panel` works through the driver, so it works while the driver runs.
+- 48 kHz by default (Rane's default, and Serato's for the SL 3); the chosen rate is remembered.
+- Device UID `com.rane.sl3.hal.device` (the HAL's saved settings for the old UID don't carry over).
+
+### Removed
+- The 0x37 heartbeat: the SL 3's firmware doesn't check it.
+- Rane's "SL 3 Audio Control Panel" System Settings pane from the installer (the app replaces it).
+- The OpenSL3 bridge (`sl3bridge`) and its diagnostic tools.
+
+### Fixed
+- `docs/PROTOCOL.md`'s errors, in its replacement `docs/SL3-COMMANDS.md`: `0x17` makes the box unbootable
+  (it was listed as a version query); the rate and control bytes reset at power-up.
+- The channel order in the instructions: 1–2 Aux, 3–4 Left deck, 5–6 Right deck.
+
+## [1.3.0] - 2026-11-10
+
+- Deep-scheduled playback with late writes from WriteMix, CoreAudio volume and mute controls, hot-plug
+  reconnect (pepelee, with Ben XO). The Stems DSP hooks were removed from the driver afterwards.
+
+## OpenSL3 history
 
 - `sl3rec` reports the dominant frequency of each channel (for example a 1 kHz timecode carrier), to check that input runs at the right rate.
 - README: recommend 44.1 kHz in Mixxx (its vinyl control can start at 44.1 kHz while the device runs at 48 kHz); troubleshooting for a stuck AirPlay helper.
