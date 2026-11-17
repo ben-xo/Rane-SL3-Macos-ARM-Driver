@@ -18,10 +18,10 @@ install: plugin
 	sudo tools/install-sl3.sh
 
 api:
-	$(CC) $(ARCH) -dynamiclib $(CFLAGS) -install_name /Library/Frameworks/Sl3Api.framework/Versions/A/Sl3Api -current_version $(VERSION) -compatibility_version 1.0.0 -framework Foundation -framework CoreAudio -framework IOKit tools/Sl3Api.m -o Sl3Api
+	$(CC) $(ARCH) -dynamiclib $(CFLAGS) -install_name /Library/Frameworks/Sl3Api.framework/Versions/A/Sl3Api -current_version $(VERSION) -compatibility_version 1.0.0 -framework Foundation -framework CoreAudio -framework IOKit -Iplugin tools/Sl3Api.m -o Sl3Api
 
 panel:
-	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio -framework IOKit -Itools tools/sl3panel.m tools/SL3Passthrough.m -o sl3panel
+	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio -framework IOKit -Itools -Iplugin tools/sl3panel.m tools/SL3Passthrough.m -o sl3panel
 
 dump:
 	$(CC) $(ARCH) $(CFLAGS) -Itools -framework Foundation -framework CoreAudio tools/sl3dump.m tools/SL3Passthrough.m -o sl3dump

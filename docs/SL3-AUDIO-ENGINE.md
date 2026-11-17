@@ -582,6 +582,13 @@ setting or early read (44), and the heartbeat below.
     - Fix: clients are kept by ID (`g_io_cids`), cleared at an unplug; a StopIO from a client not counted is
       logged and ignored.
     - Test: `make hwtest`, "unplug and replug, mid-stream"; and Serato streaming across a replug.
+25. **The status packet was defined four times, and the copies had drifted.**
+    - Cause: the driver, Sl3Api, sl3panel and the control panel's header each declared `SL3StatusPacket`;
+      Sl3Api's ended in `overload[8]` where the driver has `overload[6]`, `ext_power` and `usb_state`. A
+      field added to the driver had to be copied by hand, and a miss misreads the packet silently. Found in
+      a code review.
+    - Fix: one definition, `plugin/SL3Status.h`, included by all four (the control panel imports it).
+    - Test: everything builds; `sl3apitest`, `sl3panel status` and the control panel read the status.
 
 ## Testing
 

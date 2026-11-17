@@ -60,28 +60,7 @@ enum {
     SL3_REPORT_THRU         = 0x39,   /*   [5..8] output source: aux, left, right, ? (0 = thru) */
 };
 
-/* The driver's status ('sl3s'); must match SL3Device.m */
-typedef struct {
-    uint32_t connected;
-    uint32_t streaming;
-    uint32_t sample_rate;
-    uint32_t version_maj;
-    uint32_t version_min;
-    uint8_t  serial[32];
-    uint8_t  phono[4];
-    uint8_t  thru[4];
-    uint8_t  port_a;
-    uint8_t  port_b;
-    uint64_t cap_frames;
-    uint64_t play_frames;
-    uint32_t boot_mode;
-    uint32_t debug_build;
-    uint32_t in_safety_us;
-    uint32_t early_read;
-    uint32_t hub_depth;
-    uint64_t in_dropouts;
-    uint8_t  overload[8];
-} SL3StatusPacket;
+#include "SL3Status.h"   /* the driver's status packet ('sl3s') */
 
 /* Rane's API types */
 typedef struct { uint32_t w[4]; } sl3_version;
@@ -148,7 +127,10 @@ static bool handle_ok(void *h) {
  * ============================================================================ */
 
 /* The SL 3's CoreAudio device, cached; the cache is dropped whenever the system's device list
-   changes (the device only exists while a box is attached). */
+   changes (the device only exists while a box is attached). The library talks to the driver itself
+   rather than through tools/SL3Passthrough: it caches the device (Serato polls it many times a
+   second), and send_hid_cmd must tell no reply from a wrong one to return Rane's error codes, which
+   SL3Passthrough's true/false doesn't. */
 static _Atomic AudioObjectID g_dev = kAudioObjectUnknown;
 static OSStatus devices_changed(AudioObjectID o, UInt32 n, const AudioObjectPropertyAddress *a, void *c) {
     atomic_store(&g_dev, kAudioObjectUnknown);

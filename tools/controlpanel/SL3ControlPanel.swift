@@ -3,7 +3,7 @@
 // Left, Right) the LINE/PHONO switch, the output source (USB audio or analogue thru) and the phono
 // sensitivity; the box's overload flags, the decks' input and output levels, and the output volume. It
 // talks to the SL3Device HAL plug-in through CoreAudio, as sl3panel does:
-//   'sl3s'  the driver's status (SL3StatusPacket, SL3Status.h)
+//   'sl3s'  the driver's status (SL3StatusPacket, plugin/SL3Status.h)
 //   'sl3h'  a 64-byte HID command to the box; reading it back returns the box's reply
 //   'sl3m'  the peak level of each input and output channel since the last read
 //   'sl3i'  the input safety offset setting, in microseconds (set with nothing streaming)

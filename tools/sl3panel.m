@@ -32,30 +32,7 @@
 static const char *const kDeckNames[3] = { "aux", "left", "right" };
 static const char *const kDeckLabels[3] = { "Aux       ", "Left Deck ", "Right Deck" };
 
-/* The driver's status ('sl3s'); must match SL3Device.m */
-typedef struct {
-    uint32_t connected;
-    uint32_t streaming;
-    uint32_t sample_rate;
-    uint32_t version_maj;
-    uint32_t version_min;
-    uint8_t  serial[32];
-    uint8_t  phono[4];       /* [Aux, Left, Right]: 1 = Phono */
-    uint8_t  thru[4];        /* [Aux, Left, Right]: 1 = analogue thru */
-    uint8_t  port_a;
-    uint8_t  port_b;
-    uint64_t cap_frames;
-    uint64_t play_frames;
-    uint32_t boot_mode;
-    uint32_t debug_build;
-    uint32_t in_safety_us;
-    uint32_t early_read;
-    uint32_t hub_depth;
-    uint64_t in_dropouts;
-    uint8_t  overload[6];
-    uint8_t  ext_power;
-    uint8_t  usb_state;
-} SL3StatusPacket;
+#include "SL3Status.h"   /* the driver's status packet ('sl3s') */
 
 /* An SL 3 is in the USB registry. The driver only lists its device while a box is attached, so this
    tells "no box" from "driver not loaded". */
