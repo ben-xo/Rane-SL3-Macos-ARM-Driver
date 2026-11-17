@@ -6,9 +6,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip"><strong>⬇️ DOWNLOAD INSTALLER (.ZIP)</strong></a>
+  <a href="https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/releases/latest/download/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip"><strong>⬇️ DOWNLOAD INSTALLER (.ZIP)</strong></a>
   &nbsp;|&nbsp;
-  <a href="https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/raw/main/Installer/RaneSL3-macOS-Universal.pkg"><strong>📦 DOWNLOAD .PKG DIRECTLY</strong></a>
+  <a href="https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/releases/latest/download/RaneSL3-macOS-Universal.pkg"><strong>📦 DOWNLOAD .PKG DIRECTLY</strong></a>
+  &nbsp;|&nbsp;
+  <a href="https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/releases"><strong>📋 ALL RELEASES &amp; CHANGES</strong></a>
   &nbsp;|&nbsp;
   <a href="#-español-instrucciones-en-español"><strong>🇪🇸 LEER EN ESPAÑOL</strong></a>
 </p>
@@ -33,7 +35,7 @@ When Apple transitioned to **Apple Silicon (M1 / M2 / M3 / M4)** and modern macO
 
 ### 🚀 Quick Installation (1-Click)
 
-1. [**Download `Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip`**](https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip) and unzip it on your Mac.
+1. [**Download `Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip`**](https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/releases/latest/download/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip) and unzip it on your Mac.
 2. Open Terminal and clear macOS Gatekeeper quarantine on the downloaded folder (type `xattr -cr ` with a space at the end, drag the unzipped folder into Terminal, and press **Enter**):
    ```bash
    xattr -cr ~/Downloads/Installer
@@ -77,7 +79,7 @@ Con la llegada de los procesadores **Apple Silicon (M1 / M2 / M3 / M4)** y los n
 
 Tienes dos formas de instalarlo (ambas instalan exactamente lo mismo y **NO requieren reiniciar el Mac**):
 
-1. [**Descarga `Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip`**](https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/raw/main/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip) y descomprímelo.
+1. [**Descarga `Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip`**](https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver/releases/latest/download/Rane-SL3-Installer-Mac-M1-M2-M3-M4.zip) y descomprímelo.
 2. Si macOS bloquea los archivos descargados de Internet, abre la app **Terminal**, escribe `xattr -cr ` (con un espacio al final), arrastra la carpeta descomprimida dentro de la Terminal y pulsa **ENTER**:
    ```bash
    xattr -cr ~/Downloads/Installer
