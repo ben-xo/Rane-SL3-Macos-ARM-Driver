@@ -616,6 +616,13 @@ setting or early read (44), and the heartbeat below.
       "AppleUserUSBHostHIDDevice" when macOS's HID driver held it); the configuration is reset only if someone
       holds it, logging the holder and the error; any other failure is logged.
     - Test: `make hwtest` (normal opens); the held case as in entry 16 logs the holder's name.
+29. **Boot mode after a removal came from the version left in the status.**
+    - Cause: on a removal, whether the attached box was running Rane's loader was read from the status's
+      version, which is only refreshed when a box is opened, so it could be the departed box's. Found on the
+      SL 2 (SL 2 commit `8b899c6`).
+    - Fix: a flag (`g_bootstrap_open`) set when the open box answers the loader's version and cleared when
+      the box is closed; the removal handler uses it.
+    - Test: needs Rane's loader running (during an `sl3flash` of a box with no firmware).
 
 ## Testing
 

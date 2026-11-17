@@ -220,6 +220,7 @@ static _Atomic bool g_hw_connected = false;
 static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
 static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
 static _Atomic uint64_t g_dev_regid;         /* registry entry ID of the device g_dev opened, 0 if none */
+static _Atomic bool g_bootstrap_open = false;   /* the box the driver has open is running Rane's bootstrap */
 static uint32_t g_ref_count = 0;
 
 /* Capture ring buffer (Float32 interleaved, NCH channels), indexed by timeline position */
@@ -645,7 +646,9 @@ static void refresh_hw_status(void) {
     g_st.version_maj = maj; g_st.version_min = min;
     g_st.usb_state = 0;
     ST_UNLOCK();
-    if ((maj << 8 | min) == SL3_BOOTSTRAP_VERSION) {
+    bool loader = (maj << 8 | min) == SL3_BOOTSTRAP_VERSION;
+    atomic_store(&g_bootstrap_open, loader);
+    if (loader) {
         atomic_store(&g_boot_mode, true);
         LOG("Rane SL 3 is running Rane's firmware loader (2.25), not its firmware: no audio until the "
             "firmware is written and the box restarted.");
@@ -2068,6 +2071,7 @@ static void usb_close_all(void) {
     if (g_hid)  { [g_hid destroy]; g_hid = nil; }
     if (g_dev)  { [g_dev destroy]; g_dev = nil; }
     atomic_store(&g_dev_regid, 0);
+    atomic_store(&g_bootstrap_open, false);
     atomic_store(&g_hw_connected, false);
 }
 
@@ -2342,11 +2346,9 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
             connect_box(0);
         }
     }
-    /* Boot mode follows what is still attached (a box with no firmware, or Rane's loader, known by
-       its version); tell the HAL if the device left its list. */
-    bool loader = atomic_load(&g_box_present) &&
-                  (g_st.version_maj << 8 | g_st.version_min) == SL3_BOOTSTRAP_VERSION;
-    atomic_store(&g_boot_mode, bootloader || loader);
+    /* Boot mode follows what is still attached (a box with no firmware, or the open box running Rane's
+       loader); tell the HAL if the device left its list. */
+    atomic_store(&g_boot_mode, bootloader || (atomic_load(&g_box_present) && atomic_load(&g_bootstrap_open)));
     if (was_published != device_published()) notify_device_list_changed();
 }
 
