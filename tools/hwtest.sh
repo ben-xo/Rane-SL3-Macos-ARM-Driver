@@ -48,7 +48,7 @@ record() {   # <PASS|FAIL|SKIP> <test> [detail]
 }
 
 status() { "$PANEL" status 2>&1; }
-connected() { status | grep -q 'USB Connected : YES'; }
+connected() { [ "$(field 'USB Connected')" = YES ]; }
 field() {    # the value of an sl3panel status line, e.g. field 'Sample Rate'
     status | sed -nE "s/^  $1 *: *//p" | head -1
 }
@@ -165,7 +165,7 @@ other=$([ "$orig" = 48000 ] && echo 44100 || echo 48000)
 ok=1
 for r in $other $orig; do
     "$B/setrate" "$DEV" "$r" >/dev/null
-    wait_until "the driver to report $r Hz" sh -c "'$PANEL' status | grep -q 'Sample Rate   : $r Hz'" || ok=0
+    wait_until "the driver to report $r Hz" sh -c "'$PANEL' status | grep -qE '^  Sample Rate +: $r Hz'" || ok=0
 done
 [ $ok = 1 ] && record PASS "sample rate $orig -> $other -> $orig" || record FAIL "sample rate $orig -> $other -> $orig"
 
@@ -191,9 +191,9 @@ if [ -z "$orig_ms" ]; then
 else
     ok=1
     "$PANEL" safety 2 >/dev/null || ok=0
-    WAIT_S=5 wait_until "the driver to use 2 ms" sh -c "'$PANEL' status | grep -q 'Input Safety  : 2 ms'" || ok=0
+    WAIT_S=5 wait_until "the driver to use 2 ms" sh -c "'$PANEL' status | grep -qE '^  Input Safety +: 2 ms'" || ok=0
     "$PANEL" safety "$orig_ms" >/dev/null || ok=0
-    WAIT_S=5 wait_until "the driver to use $orig_ms ms again" sh -c "'$PANEL' status | grep -q 'Input Safety  : $orig_ms ms'" || ok=0
+    WAIT_S=5 wait_until "the driver to use $orig_ms ms again" sh -c "'$PANEL' status | grep -qE '^  Input Safety +: $orig_ms ms'" || ok=0
     [ $ok = 1 ] && record PASS "input safety offset setting" "2 ms, then back to $orig_ms ms" \
                 || record FAIL "input safety offset setting" "status: $(field 'Input Safety')"
 fi
@@ -396,7 +396,7 @@ else
         "$B/sl3dbg" noearly 0 >/dev/null
         er=$(field 'Early Read'); safety=$(field 'Input Safety')
         "$PANEL" safety "$set_ms" >/dev/null
-        WAIT_S=5 wait_until "the judgement cleared" sh -c "'$PANEL' status | grep -q 'Early Read    : not judged yet'"; cleared=$?
+        WAIT_S=5 wait_until "the judgement cleared" sh -c "'$PANEL' status | grep -qE '^  Early Read +: not judged yet'"; cleared=$?
         if [ "${er#NOT WORKING}" != "$er" ] && [ "$safety" = "$("$PANEL" status | sed -nE 's/^  Input Safety *: *//p')" ] && [ $cleared = 0 ]; then
             record PASS "early read reported not working" "offset left at $safety; judged afresh after setting it"
         else
