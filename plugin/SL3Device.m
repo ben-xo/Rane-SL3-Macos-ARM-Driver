@@ -32,6 +32,7 @@
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <os/log.h>
+#include <os/lock.h>
 #include <stdatomic.h>
 #include <math.h>
 
@@ -421,6 +422,12 @@ static uint8_t  g_wait_cmd = 0;
 static uint32_t g_wait_seq = 0;
 static uint8_t  g_reply_buf[HID_REPORT_LEN];
 static SL3StatusPacket g_st;
+/* g_st's box-state fields are written from the USB queue (reports), the hot-plug queue and client
+   threads: each write, and the copy 'sl3s' returns, is made under g_st_lock, so a client never gets
+   a packet mixed from two updates. Held only for the copy, never across a HID command. */
+static os_unfair_lock g_st_lock = OS_UNFAIR_LOCK_INIT;
+#define ST_LOCK()   os_unfair_lock_lock(&g_st_lock)
+#define ST_UNLOCK() os_unfair_lock_unlock(&g_st_lock)
 
 
 /* Reports for clients (see unsol_push) */
@@ -481,13 +488,16 @@ static void push_sr_unsol(int sr) {
 
 /* What a report or reply says about the box's state, into the status packet. */
 static void note_controls(const uint8_t c[SL3_CONTROLS_LEN]) {
+    ST_LOCK();
     for (int d = 0; d < SL3_NDECKS; d++) {
         g_st.phono[d] = c[SL3_CTL_LINE_PHONO + d] ? 1 : 0;
         g_st.thru[d] = c[SL3_CTL_SOURCE_AT(d)] ? 0 : 1;
     }
     g_st.ext_power = c[SL3_CTL_EXT_POWER];
+    ST_UNLOCK();
 }
 static void note_report(const uint8_t *b) {
+    ST_LOCK();
     if (b[0] == SL3_REPORT_OVERLOAD) {
         memcpy(g_st.overload, b + 5, sizeof g_st.overload);
     } else if (b[0] == SL3_REPORT_PHONO) {
@@ -496,6 +506,7 @@ static void note_report(const uint8_t *b) {
         for (int d = 0; d < SL3_NDECKS; d++) g_st.thru[d] = b[5 + d] ? 0 : 1;
         g_st.ext_power = b[8];
     }
+    ST_UNLOCK();
 }
 
 /* Keep one read queued on the HID IN pipe (runs on g_q). Each report is either the reply hid_cmd
@@ -621,16 +632,19 @@ static void refresh_hw_status(void) {
        minor (02 32 = 2.50), a 32-bit build stamp at reply[7..10]. Rane's RAM-loaded EEPROM writer
        enumerates exactly like the running firmware and answers 02 19 (2.25): that box has no audio. */
     uint8_t r[64];
-    g_st.version_maj = g_st.version_min = 0;   /* not the previous box's, if this one doesn't answer */
-    g_st.usb_state = 0;
+    uint8_t maj = 0, min = 0;   /* 0.00, not the previous box's, if this one doesn't answer */
     for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be booting its DSP */
         if (hid_cmd(SL3_CMD_VERSION, NULL, 0, r, NULL)) {
-            g_st.version_maj = r[5];
-            g_st.version_min = r[6];
+            maj = r[5];
+            min = r[6];
             break;
         }
     }
-    if ((g_st.version_maj << 8 | g_st.version_min) == SL3_BOOTSTRAP_VERSION) {
+    ST_LOCK();
+    g_st.version_maj = maj; g_st.version_min = min;
+    g_st.usb_state = 0;
+    ST_UNLOCK();
+    if ((maj << 8 | min) == SL3_BOOTSTRAP_VERSION) {
         atomic_store(&g_boot_mode, true);
         LOG("Rane SL 3 is running Rane's firmware loader (2.25), not its firmware: no audio until the "
             "firmware is written and the box restarted.");
@@ -639,7 +653,7 @@ static void refresh_hw_status(void) {
        only its HID interface, so there is no audio: say so, as the only other sign is a failed
        stream start. */
     if (hid_cmd(SL3_CMD_USB_STATE, NULL, 0, r, NULL)) {
-        g_st.usb_state = r[5];
+        ST_LOCK(); g_st.usb_state = r[5]; ST_UNLOCK();
         if (r[5] == 1)
             LOG("The SL 3 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
     }
@@ -647,8 +661,10 @@ static void refresh_hw_status(void) {
        has no command that gives a per-unit serial. */
     CFTypeRef ser = IORegistryEntryCreateCFProperty(g_dev.ioService, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
     if (ser) {
-        if (CFGetTypeID(ser) == CFStringGetTypeID())
-            CFStringGetCString((CFStringRef)ser, (char *)g_st.serial, sizeof g_st.serial, kCFStringEncodingUTF8);
+        char sb[sizeof g_st.serial] = {0};
+        if (CFGetTypeID(ser) == CFStringGetTypeID() && CFStringGetCString((CFStringRef)ser, sb, sizeof sb, kCFStringEncodingUTF8)) {
+            ST_LOCK(); memcpy(g_st.serial, sb, sizeof sb); ST_UNLOCK();
+        }
         CFRelease(ser);
     }
     /* Enable the box's unsolicited reports (0x36; the box clears this at every enumeration, and drops
@@ -657,7 +673,7 @@ static void refresh_hw_status(void) {
     uint8_t enable[1] = { 1 };
     hid_cmd(SL3_CMD_REPORTS, enable, 1, NULL, NULL);
     if (hid_cmd(SL3_CMD_GET_CONTROLS, NULL, 0, r, NULL)) note_controls(r + 5);
-    if (hid_cmd(SL3_CMD_GET_OVERLOAD, NULL, 0, r, NULL)) memcpy(g_st.overload, r + 5, sizeof g_st.overload);
+    if (hid_cmd(SL3_CMD_GET_OVERLOAD, NULL, 0, r, NULL)) { ST_LOCK(); memcpy(g_st.overload, r + 5, sizeof g_st.overload); ST_UNLOCK(); }
 }
 
 static void send_hw_samplerate(int sr) {
@@ -673,7 +689,7 @@ static void set_sources(const uint8_t source[SL3_NDECKS]) {
     for (int d = 0; d < SL3_NDECKS; d++) {
         uint8_t pl[3] = { (uint8_t)SL3_CTL_SOURCE_AT(d), 1, source[d] ? 1 : 0 };
         hid_cmd(SL3_CMD_SET_CONTROLS, pl, 3, NULL, NULL);
-        g_st.thru[d] = source[d] ? 0 : 1;
+        ST_LOCK(); g_st.thru[d] = source[d] ? 0 : 1; ST_UNLOCK();
     }
 }
 static void set_usb_switches(bool usb_mode) {
@@ -2287,7 +2303,9 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         pthread_mutex_lock(&g_mutex);
         /* A client streaming: remember the decks' routing, to restore after a replug (g_resume_pending). */
         if (g_io_clients > 0 && atomic_load(&g_io_running)) {
+            ST_LOCK();
             for (int d = 0; d < SL3_NDECKS; d++) g_resume_source[d] = g_st.thru[d] ? 0 : 1;
+            ST_UNLOCK();
             g_resume_pending = true;
             g_resume_window++;
             g_resume_since = mach_absolute_time();
@@ -3072,6 +3090,7 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 /* The status packet: fill in the live fields (the HID code keeps the rest up to
                    date), then return a copy as CFData. */
                 pthread_mutex_lock(&g_mutex);
+                ST_LOCK();
                 g_st.connected = atomic_load(&g_hw_connected) ? 1 : 0;
                 g_st.streaming = atomic_load(&g_io_running) ? 1 : 0;
                 g_st.sample_rate = (uint32_t)g_sr;
@@ -3083,8 +3102,10 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 g_st.early_read = atomic_load(&g_early_state);
                 g_st.hub_depth = atomic_load(&g_hub_depth);
                 g_st.in_dropouts = atomic_load(&g_in_dropouts);
+                SL3StatusPacket copy = g_st;
+                ST_UNLOCK();
                 pthread_mutex_unlock(&g_mutex);
-                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&g_st, sizeof(g_st));
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&copy, sizeof(copy));
                 *outSize = sizeof(CFDataRef);
                 return 0;
             }
@@ -3295,8 +3316,9 @@ static OSStatus SL3_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 if (answered && req[0] == SL3_CMD_SET_CONTROLS) {
                     for (int d = 0; d < SL3_NDECKS; d++) {
                         int idx = SL3_CTL_SOURCE_AT(d), at = idx - req[5];
-                        if (at >= 0 && at < req[6] && idx < SL3_CONTROLS_LEN - 1 && req[7 + at] <= 1)
-                            g_st.thru[d] = req[7 + at] ? 0 : 1;
+                        if (at >= 0 && at < req[6] && idx < SL3_CONTROLS_LEN - 1 && req[7 + at] <= 1) {
+                            ST_LOCK(); g_st.thru[d] = req[7 + at] ? 0 : 1; ST_UNLOCK();
+                        }
                     }
                 }
                 pthread_mutex_unlock(&g_mutex);

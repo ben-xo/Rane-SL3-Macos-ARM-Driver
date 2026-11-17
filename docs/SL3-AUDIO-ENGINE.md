@@ -559,6 +559,13 @@ setting or early read (44), and the heartbeat below.
       second sample-rate event. Found in a code review.
     - Fix: the restart and the no-stream case are separate branches.
     - Test: `make hwtest`, "the other sample rate" (one "Sample rate changed" per change).
+22. **A client could read a status packet mixed from two updates.**
+    - Cause: the `'sl3s'` getter filled the live fields under `g_mutex` but copied `g_st` after unlocking,
+      and the box's reports updated `g_st` on the USB queue without any lock, so a client could get thru
+      flags from two reports, or a half-written serial or version. Found in a code review.
+    - Fix: every write of `g_st` and the getter's copy are made under `g_st_lock` (an `os_unfair_lock`,
+      held only for the copy, never across a HID command); the getter returns its copy.
+    - Test: `make hwtest` (status reads throughout, `sl3apitest`); the tear itself is too narrow to hit.
 
 ## Testing
 
