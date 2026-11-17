@@ -11,7 +11,7 @@
  *                     without changing anything
  *     --backup-only   save the EEPROM to sl3-eeprom-backup-<date>.bin and change nothing (a box with
  *                     no firmware first has the bootstrap loaded into its RAM to read it, and runs it
- *                     until it is power-cycled); needs no final image
+ *                     until it is power-cycled); needs no final image; not with --dry-run
  *     --wait SECONDS  wait up to this long for a box to be connected
  *     --blank-fx2     also take a Cypress FX2 with a blank EEPROM (04b4:8613) as the SL 3: any
  *                     other device built on a blank FX2 (a logic analyser, say) shows up the same
@@ -370,6 +370,9 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "usage: %s [--firmware DIR] [--force] [--dry-run] [--backup-only] [--wait SECONDS] [--blank-fx2]\n", argv[0]); return 2; }
     }
 
+    /* A dry run changes nothing, and a backup of a box with no firmware means loading the bootstrap. */
+    if (dry && backup_only) { fprintf(stderr, "--dry-run and --backup-only can't be used together\n"); return 2; }
+
     /* The images (a backup needs none, unless the bootstrap has to be loaded to read the EEPROM). */
     image_t final = {0}, boot = {0};
     if (!load_images(dir, &final, &boot) && !backup_only) return 1;
@@ -411,7 +414,7 @@ int main(int argc, char **argv) {
     } else {
         printf("SL 3 with no firmware running (%04x:%04x, no strings)\n", b[0].vid, b[0].vid == SL3_VID ? SL3_PID : FX2_DEFAULT_PID);
         if (!boot.data) { printf("no bootstrap image in %s; it is needed for a box in this state\n", dir); release_boxes(b, n); return 1; }
-        if (dry && !backup_only) { printf("dry run: would load the bootstrap, then program the EEPROM\n"); release_boxes(b, n); return EXIT_WOULD_WRITE; }
+        if (dry) { printf("dry run: would load the bootstrap, then program the EEPROM\n"); release_boxes(b, n); return EXIT_WOULD_WRITE; }
         bool ok = stage1(b[0].svc, boot.data);
         release_boxes(b, n);
         if (!ok) return 1;
