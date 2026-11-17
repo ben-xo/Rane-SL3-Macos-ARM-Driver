@@ -29,6 +29,10 @@ SL 3 with firmware 2.31 and 2.50 (debug build; the release build's box-only test
   `sl3flash` (over USB, with a backup first and verification before the EEPROM is marked bootable; used to
   update an SL 3 from 2.31 to 2.50; it won't write older firmware than the box runs without `--force`,
   and `--backup-only` saves the EEPROM without writing), and `sl3dump` (EEPROM backup and verify).
+- **`Installer/Firmware-SL3.command`**: downloads Rane's own SL 3 driver (2.0.1f2) from the Internet Archive,
+  checks it is the original, and updates the box to firmware 2.50 with `sl3flash`; the control panel's
+  "Update Firmware…" (and "Restore Firmware…" for a box with no firmware) runs it in Terminal.
+- **`docs/RELEASING.md`**: how a maintainer cuts a release; the README downloads from the latest release.
 - **Tests:** `make hwtest` (the hardware tests in one run), `tools/latency/` (round-trip latency and
   glitch tests), `sl3apitest` (Sl3Api as Serato DJ Pro 2.5.5 calls it).
 - **`make package`**: the installer package and zip built from source, with no Rane binaries.
