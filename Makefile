@@ -33,6 +33,10 @@ flash:
 controlpanel:
 	tools/controlpanel/build-app.sh
 
+# the installer package and download zip, built into build/ (VERSION=x.y.z, default from VERSION)
+package:
+	Installer/build-pkg.sh $(VERSION)
+
 # sl3apitest: checks Sl3Api as Serato DJ Pro 2.5.5 uses it (run the x86_64 slice with arch -x86_64)
 apitest:
 	$(CC) $(ARCH) -O2 tools/sl3apitest.c -o sl3apitest
@@ -57,4 +61,4 @@ clean:
 	rm -f SL3Device Sl3Api sl3panel sl3apitest sl3dump sl3flash
 	rm -rf tools/latency/bin "SL 3 Control Panel.app" build
 
-.PHONY: all plugin install api panel dump flash controlpanel apitest latency hwtest clean
+.PHONY: all plugin install api panel dump flash controlpanel package apitest latency hwtest clean
