@@ -114,7 +114,7 @@ make hwtest ARGS="--loopback"   # the hardware tests (see tools/latency/README.m
 * `plugin/SL3Device.m`: the CoreAudio HAL AudioServerPlugIn (`SL3Device.driver`), driving the box over IOUSBHost.
 * `tools/Sl3Api.m`: replacement `Sl3Api.framework`, matching Rane's 2.0.1f2, for Serato DJ Pro 2.5.5.
 * `tools/sl3panel.m`, `tools/controlpanel/`: status and control, in Terminal and as an app.
-* `tools/firmware/`, `tools/sl3dump.m`: firmware extraction from Rane's driver, over-USB flashing (not yet tested on an SL 3), EEPROM backup.
+* `tools/firmware/`, `tools/sl3dump.m`: firmware extraction from Rane's driver, over-USB flashing (tested updating an SL 3 from 2.31 to 2.50), EEPROM backup; `Installer/Firmware-SL3.command` downloads Rane's driver and does the whole update.
 * `tools/latency/`, `tools/hwtest.sh`: latency, glitch and hardware tests.
 * Docs: `docs/SL3-AUDIO-ENGINE.md` (design and bug catalogue), `docs/SL3-COMMANDS.md` (the box's protocol), `AGENTS.md` (for contributors).
 

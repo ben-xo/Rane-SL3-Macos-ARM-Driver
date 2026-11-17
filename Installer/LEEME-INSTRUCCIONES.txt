@@ -38,6 +38,15 @@
                                   la cuarentena de Gatekeeper e instala todo).
 - Panel-Control-SL3.command    -> Abre la app SL 3 Control Panel (o muestra
                                   el estado de la Rane SL3 en Terminal).
+- Firmware-SL3.command         -> Actualiza el firmware de la Rane SL3 a la
+                                  version 2.50 (la ultima de Rane), o
+                                  recupera una SL3 que ha quedado sin
+                                  firmware. Descarga el driver 2.0.1f2 de
+                                  Rane desde el Internet Archive, comprueba
+                                  que es el archivo original, guarda una
+                                  copia del firmware actual y pregunta antes
+                                  de escribir. Nunca instala un firmware mas
+                                  antiguo que el de la caja.
 - Desinstalar-Rane-SL3.command -> Elimina el driver y sus componentes si
                                   deseas desinstalarlo.
 

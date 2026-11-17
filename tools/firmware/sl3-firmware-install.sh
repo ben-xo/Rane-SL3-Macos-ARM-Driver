@@ -10,7 +10,7 @@
 # The images are taken from your own copy of an official Rane / Serato driver (see
 # tools/firmware/extract-sl3-firmware.py); they are not distributed with this project.
 #
-#   sudo tools/firmware/sl2-firmware-install.sh IMAGE.bin [IMAGE2.bin ...]
+#   sudo tools/firmware/sl3-firmware-install.sh IMAGE.bin [IMAGE2.bin ...]
 set -e
 FW=/Library/Audio/Plug-Ins/HAL/SL3Device.firmware
 [ $# -ge 1 ] || { echo "usage: sudo $0 IMAGE.bin [IMAGE2.bin ...]"; exit 2; }

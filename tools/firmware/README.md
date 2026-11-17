@@ -10,8 +10,20 @@ and answers firmware version 2.50.
 The firmware is Rane's and is **not** included here. You extract it from **your own** copy of
 Rane's SL 3 driver, `RaneSL3_2.0.1f2.pkg`, with `extract-sl3-firmware.py`; `.gitignore` keeps the
 extracted images out of the repository. (Serato DJ Pro 2.5.5 carries that package among its
-resources and offers to install it when an SL 3 is connected; it is also in Rane's and Serato's
-driver archives.)
+resources and offers to install it when an SL 3 is connected.) Rane's own download of it,
+`Sl3-2.0.1f2.zip` (whose `Sl3.pkg` is the same package, byte for byte), is no longer on rane.com,
+but the Internet Archive keeps it:
+`https://web.archive.org/web/20170721213635id_/http://dj.rane.com/files/product-downloads/Sl3-2.0.1f2.zip`
+(228,447 bytes, SHA-256 `e6558b7d8c95148a9629a0c2a70dfb8e4dd0351fb03c43b158304a08f1617264`).
+
+## The easy way: `Installer/Firmware-SL3.command`
+
+The script in the installer folder does the whole job: it finds `Sl3-2.0.1f2.zip` in `~/Downloads`
+or downloads it from the Internet Archive (using only a zip with the SHA-256 above; if the download
+fails, it opens the link for a browser to fetch), extracts the firmware, installs it for `sl3flash`
+(asks for your password), checks the box with `sl3flash --dry-run` and asks before writing. It runs
+from the installer folder (the download zip carries `tools/firmware`) or a checkout, with the
+package's `/usr/local/bin/sl3flash` or a `make flash` build.
 
 ## Writing it over USB, with `sl3flash`
 
