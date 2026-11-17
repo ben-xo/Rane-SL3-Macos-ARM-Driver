@@ -66,10 +66,13 @@ pkgbuild --root "$STAGE" --component-plist "$WORK/components.plist" --scripts "$
     --identifier com.pepelee.ranesl3.driver --version "$VERSION" --install-location / \
     "$WORK/pkgs/RaneSL3-Core.pkg"
 
-# The product package, with the installer's pages.
+# The product package, with the installer's pages, and its background drawn from the control panel's icon.
 sed "s/@VERSION@/$VERSION/" "$PKGSRC/Distribution.xml" > "$WORK/Distribution.xml"
+cp -R "$PKGSRC/resources" "$WORK/resources"
+swiftc -O tools/controlpanel/make-icon.swift -o "$WORK/make-icon"
+"$WORK/make-icon" --installer-background "$WORK/resources/background.png"
 mkdir -p "$OUT"
-productbuild --distribution "$WORK/Distribution.xml" --resources "$PKGSRC/resources" \
+productbuild --distribution "$WORK/Distribution.xml" --resources "$WORK/resources" \
     --package-path "$WORK/pkgs" "$OUT/RaneSL3-macOS-Universal.pkg"
 
 # The download zip: the Installer folder's user-facing files with the new package, and tools/firmware.
