@@ -104,9 +104,9 @@ Tienes dos formas de instalarlo (ambas instalan exactamente lo mismo y **NO requ
 ### 🛠️ Compilar desde el código fuente / Build from Source
 Requires Xcode Command Line Tools (`xcode-select --install`):
 ```bash
-make device-plugin
+make
 ```
-* `plugin/SL3Device.m`: CoreAudio HAL AudioServerPlugIn (`SL3Device.driver`) with shared IPC control/status state and EZ-USB FX2 firmware loader.
+* `plugin/SL3Device.m`: CoreAudio HAL AudioServerPlugIn (`SL3Device.driver`) with shared IPC control/status state.
 * `tools/Sl3Api.m`: Replacement `Sl3Api.framework` (`C Sl3Api` C++ ABI bridge) for Serato DJ Pro 2.5.5 & System Settings preference pane.
 * `tools/sl3panel.m`: CLI & interactive control panel for Phono/Line, Thru, and sample rate switching.
 

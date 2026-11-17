@@ -1,0 +1,7 @@
+# build products (see Makefile)
+/SL3Device
+/Sl3Api
+/sl3panel
+*.o
+*.dSYM/
+.DS_Store
