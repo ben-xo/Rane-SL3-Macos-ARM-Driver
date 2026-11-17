@@ -519,6 +519,15 @@ setting or early read (44), and the heartbeat below.
       HAL folder and coreaudiod restarted, configure the box from a tool with `matchInterfaces:YES` (the HID
       driver attaches to interface 3), put the driver back: "held by another driver: setting the box's
       configuration again", and the box answers.
+17. **Playback could be switched back on after a stop, and its buffers freed under WriteMix.**
+    - Cause: `dp_start` (on the USB queue, from the first capture completion) checks the stream generation
+      on entry and sets `g_dp_active` a few steps later; a stop that ran `dp_stop` in between was undone,
+      and `dp_release` then freed the schedule's buffers while WriteMix could be writing into them. Found
+      in a code review.
+    - Fix: `usb_release_audio` runs `dp_stop` again inside its block on the USB queue, before `dp_release`;
+      the queue is serial, so no `dp_start` can run between the two.
+    - Test: `make hwtest` (restarts, rate changes and the mid-stream replug stop streams); the window itself
+      is too narrow to hit on purpose.
 
 ## Testing
 
