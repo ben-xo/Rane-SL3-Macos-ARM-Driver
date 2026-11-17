@@ -537,6 +537,15 @@ setting or early read (44), and the heartbeat below.
     - Fix: the registry entry ID of the device the driver opens is kept (`g_dev_regid`), and the removal
       handler closes everything when that ID is among the removed, then opens the box that is attached.
     - Test: `make hwtest`'s replugs (the usual order); the race needs the queue held busy across a replug.
+19. **HID input could stop for good, or spin on the USB queue.**
+    - Cause: `hid_read` ignored a refused enqueue (no read was queued again: every command then timed out
+      until a replug), and requeued at once after any completion but an abort, so a pipe that kept failing
+      (a halted endpoint) looped on the USB queue that also runs the audio completions. Found in a code
+      review.
+    - Fix: a refused enqueue is retried after 100 ms; after an errored completion the endpoint's halt is
+      cleared and the next read waits 10 ms; a retry goes ahead only on the pipe it was for. Each error is
+      logged once, not per retry.
+    - Test: `make hwtest` (the HID path throughout); the error paths have no fault hook yet.
 
 ## Testing
 
