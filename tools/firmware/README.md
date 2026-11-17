@@ -23,7 +23,9 @@ or downloads it from the Internet Archive (using only a zip with the SHA-256 abo
 fails, it opens the link for a browser to fetch), extracts the firmware, installs it for `sl3flash`
 (asks for your password), checks the box with `sl3flash --dry-run` and asks before writing. It runs
 from the installer folder (the download zip carries `tools/firmware`) or a checkout, with the
-package's `/usr/local/bin/sl3flash` or a `make flash` build.
+package's `/usr/local/bin/sl3flash` or a `make flash` build. The SL 3 Control Panel carries it too,
+with the extractor and the install helper: its "Update Firmware…" button (beside firmware older than
+2.50) and "Restore Firmware…" (for a box with no firmware) open it in Terminal.
 
 ## Writing it over USB, with `sl3flash`
 
