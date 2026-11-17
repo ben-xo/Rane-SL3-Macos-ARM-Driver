@@ -106,7 +106,7 @@ typedef struct Client {
     struct Client *next;
 } Client;
 
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;     /* the clients; callbacks are called under it */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;     /* the clients (callbacks are called outside it) */
 static pthread_mutex_t g_cmd_lock = PTHREAD_MUTEX_INITIALIZER; /* one command at a time per process */
 static Client  *g_clients;
 static uintptr_t g_next_handle = 1;
@@ -300,36 +300,50 @@ static int send_hid_cmd(uint8_t cmd, const uint8_t *args, size_t nargs, uint8_t 
  * Reports and events, polled from the driver and passed to every client's callbacks
  * ============================================================================ */
 
+/* The open handles' callbacks, copied under g_lock so they can be called without it: a callback may
+   call back into the API (Rane's lock is recursive, so that works with Rane's too), or wait on a
+   thread that is calling into it. A handle closed after the copy may get one last call. */
+#define MAX_CALLBACKS 64
+typedef struct { overload_cb_t overload; phono_cb_t phono; thru_cb_t thru; port_cb_t port; } Callbacks;
+static int copy_callbacks(Callbacks out[MAX_CALLBACKS]) {
+    int n = 0;
+    pthread_mutex_lock(&g_lock);
+    for (Client *c = g_clients; c && n < MAX_CALLBACKS; c = c->next)
+        out[n++] = (Callbacks){ c->overload_cb, c->phono_cb, c->thru_cb, c->port_cb };
+    pthread_mutex_unlock(&g_lock);
+    return n;
+}
+
 static void dispatch_report(const uint8_t pkt[HID_REPORT_LEN]) {
     /* As Rane's HandleUnsolicitedData: the report's payload goes to the matching callback of every
        open handle. */
-    pthread_mutex_lock(&g_lock);
-    for (Client *c = g_clients; c; c = c->next) {
-        if (pkt[0] == SL3_REPORT_OVERLOAD && c->overload_cb) {
+    Callbacks cb[MAX_CALLBACKS];
+    int n = copy_callbacks(cb);
+    for (int i = 0; i < n; i++) {
+        if (pkt[0] == SL3_REPORT_OVERLOAD && cb[i].overload) {
             sl3_overload_status_data o;
             memcpy(o.b, pkt + 5, sizeof o.b);
-            c->overload_cb(&o);
-        } else if (pkt[0] == SL3_REPORT_PHONO && c->phono_cb) {
+            cb[i].overload(&o);
+        } else if (pkt[0] == SL3_REPORT_PHONO && cb[i].phono) {
             sl3_phonoswitch_status_data p = { pkt[5], pkt[6], pkt[7] };
-            c->phono_cb(&p);
-        } else if (pkt[0] == SL3_REPORT_THRU && c->thru_cb) {
+            cb[i].phono(&p);
+        } else if (pkt[0] == SL3_REPORT_THRU && cb[i].thru) {
             sl3_thrustate_status_data t = { pkt[5], pkt[6], pkt[7], pkt[8] };
-            c->thru_cb(&t);
+            cb[i].thru(&t);
         }
     }
-    pthread_mutex_unlock(&g_lock);
     TRACE(": report %{public}.12P", pkt);
 }
 
 /* Call every client's port-status callback: {1, 0} when the box appears, {0, 0} when it goes. */
 static void dispatch_port_status(bool connected) {
-    pthread_mutex_lock(&g_lock);
-    for (Client *c = g_clients; c; c = c->next) {
-        if (!c->port_cb) continue;
+    Callbacks cb[MAX_CALLBACKS];
+    int n = copy_callbacks(cb);
+    for (int i = 0; i < n; i++) {
+        if (!cb[i].port) continue;
         sl3_usb_port_status_t ps = { connected ? 1 : 0, 0 };
-        c->port_cb(&ps);
+        cb[i].port(&ps);
     }
-    pthread_mutex_unlock(&g_lock);
     TRACE(": port status {%d, 0}", connected ? 1 : 0);
 }
 
