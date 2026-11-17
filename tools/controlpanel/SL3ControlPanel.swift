@@ -201,6 +201,9 @@ enum SL3Driver {
         AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
     }
 
+    /// System Settings' Sound pane, where the SL 3 can be chosen as the input device.
+    static let soundSettings = URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")
+
     /// Audio MIDI Setup, where each output channel's volume is set.
     static let audioMIDISetup = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.audio.AudioMIDISetup")
 
@@ -750,6 +753,16 @@ struct PanelView: View {
         return text
     }
 
+    /// Over the input meters while no app is using the SL 3: there is nothing to measure then (the decks are
+    /// on thru and the box sends no audio), so say how to make them move, with "Sound Settings" a link to it.
+    private var inputsIdleNote: AttributedString {
+        var text = AttributedString("Choose the SL 3 as your input device in ")
+        var pane = AttributedString("Sound Settings")
+        if let url = SL3Driver.soundSettings { pane.link = url }
+        text.append(pane)
+        return text
+    }
+
     /// The right column: any warnings, the input levels and overload flags, and the output volume and levels.
     @ViewBuilder
     private func levelSections(_ box: BoxState) -> some View {
@@ -764,12 +777,27 @@ struct PanelView: View {
             }
         }
         Section {
-            DeckMeters(meters: model.meters, first: 0)
+            // The meters as one block, greyed out with a note over them while nothing streams.
+            VStack(spacing: 12) {
+                DeckMeters(meters: model.meters, first: 0)
+            }
+            .padding(.vertical, 4)
+            .opacity(box.streaming ? 1 : 0.3)
+            .overlay {
+                if !box.streaming {
+                    Text(inputsIdleNote)
+                        .font(.callout)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
             LabeledContent("Overload flags") { OverloadFlags(flags: box.overload) }
         } header: {
             Text("Inputs")
         } footer: {
-            Text("The level of each deck's input, left and right, while an app is using the SL 3. With nothing using it the decks are on thru, and the box sends the computer no audio. The overload flags are the six the box reports.")
+            Text("The level of each deck's input, left and right, while an app is using the SL 3 (as its input or output device). With nothing using it the decks are on thru, and the box sends the computer no audio. The overload flags are the six the box reports.")
                 .foregroundStyle(.secondary)
         }
         Section {
