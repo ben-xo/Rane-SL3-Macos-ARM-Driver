@@ -56,7 +56,7 @@ still to be confirmed on the hardware.
 - Isochronous endpoints `0x06` OUT and `0x82` IN, 126-byte packets: 7 frames × 6 channels × 3 bytes. The
   samples are packed 24-bit, with no pad byte (c.f. the SL 2's 4-byte samples). (Descriptors.)
 - Channels 1-2 Aux, 3-4 Left deck, 5-6 Right deck; the control bytes and reports come in the same order.
-  (Rane's labels; channel 3 = Left Deck L confirmed with a loopback cable.)
+  (Rane's labels; confirmed with a loopback cable on each deck: 1 = Aux L, 3 = Left Deck L, 5 = Right Deck L.)
 - Boxes in the field run different firmware: one tested runs 2.31, Rane's last driver carries 2.50, and they
   differ (2.31 has no `0x39` report; its DSP boot puts the decks on USB and the rate at 44.1 kHz).
   `docs/SL3-COMMANDS.md` says which is which.

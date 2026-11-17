@@ -529,7 +529,9 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
 - **Measured on an SL 3 (firmware 2.31)**: the round trip at every IO buffer from 32 to 512 frames at both
   rates, the latency to report, the early read's margin, that the box takes predicted OUT packet sizes
   (sent − captured within 2), no heartbeat needed, the packet sizes (5/6 frames at 44.1 kHz; 6 at 48 kHz with
-  about 0.5% of 5s and 7s as the box corrects its clock), channel 3 = Left Deck L.
+  about 0.5% of 5s and 7s as the box corrects its clock), the channel order (a loopback on each deck:
+  1 = Aux L, 3 = Left Deck L, 5 = Right Deck L, each with an 11.8–11.9 ms round trip at 128 frames and a
+  clean 20 s glitch test).
 - **Two glitchy runs** (see Results), cause unknown, not reproduced.
 - **Also confirmed on the SL 3:** each deck's LINE/PHONO report (`0x38`; the box doesn't debounce, so
   readings can flicker for ~0.2 s while a switch moves), unplug and replug idle and mid-stream (every deck
@@ -539,8 +541,8 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
   after the wake the driver logged "a deck was on USB audio with nothing streaming: back to thru" and "the
   box was at 44100 Hz: set to 48000 Hz", as the 2.31 firmware's DSP boot predicts. `make hwtest` has a
   step for it (skipped while something holds a PreventSystemSleep assertion, as Internet Sharing does).
-- **Still to confirm on the hardware:** the settle check after a slow DSP boot at connect; the other channels
-  (Aux, Right deck) carrying audio; how a box with no firmware enumerates; firmware 2.50 (the box tested
+- **Still to confirm on the hardware:** the settle check after a slow DSP boot at connect; the right-hand
+  channels (2, 4, 6) carrying audio; how a box with no firmware enumerates; firmware 2.50 (the box tested
   runs 2.31); the firmware tools; Serato DJ Pro 2.5.5 with turntables; Serato 4.x / 5.x.
 - **Control bytes 4–7 of each deck's block** are passed to the DSP with unknown meaning (two 0–127 values at
   96, two flags at 0). One of them may be a level.
