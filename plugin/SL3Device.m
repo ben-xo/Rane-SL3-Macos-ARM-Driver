@@ -1690,7 +1690,7 @@ static bool usb_ensure_hid(void) {
         g_dev = [[IOUSBHostDevice alloc] initWithIOService:svc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
         uint32_t hubs = usb_hub_depth(svc);
         atomic_store(&g_hub_depth, hubs);
-        if (hubs) LOG("Rane SL 3 is connected through %u USB hub%s", hubs, hubs > 1 ? "s" : "");
+        if (hubs) LOG("Rane SL 3 is connected through %u USB hub%{public}s", hubs, hubs > 1 ? "s" : "");
         IOObjectRelease(svc);
         if (!g_dev) { LOG("Failed to open IOUSBHostDevice: %{public}@", e); return false; }
     }
@@ -2166,7 +2166,7 @@ static OSStatus SL3_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     mach_timebase_info(&g_tb);
     clk_reset();
     start_hotplug_monitor();
-    LOG("SL3Device %s (%s) AudioServerPlugIn Initialized", SL3_VERSION, SL3_DEBUG ? "DEBUG" : "release");
+    LOG("SL3Device %{public}s (%{public}s) AudioServerPlugIn Initialized", SL3_VERSION, SL3_DEBUG ? "DEBUG" : "release");
     return kAudioHardwareNoError;
 }
 
