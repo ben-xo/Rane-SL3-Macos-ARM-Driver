@@ -380,6 +380,9 @@ traffic stopping). It differs in:
 
 Measured on that box: the rate is 48000 after the driver sets it and stays there through re-enumeration;
 control bytes 4/6 of each block read `0x60`, 5/7 read 0; the phono sensitivity byte can be set and is saved.
+The `0x38` report follows each deck's switch, without debouncing: a switch can read PHONO–LINE–PHONO within
+half a second as it moves, and flipping one switch made its neighbour (the deck before it: Aux for Left,
+Left for Right) read PHONO for about 0.2 s; every reading settled to the switch's position.
 
 ### Corrections to earlier notes on this box
 
