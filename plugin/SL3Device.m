@@ -1187,8 +1187,8 @@ static _Atomic uint64_t g_cap_head;     /* timeline position just past the last 
  *   CAP_MARK has not been written. (The SL 3's samples are packed 24-bit, with no pad byte that is
  *   always 0, c.f. the SL 2: a real frame equal to the mark would need all six samples at
  *   0xA5A5A5, which audio doesn't produce.) The frames before the first unwritten slot are the
- *   ones that arrived; the last of them counts only once its last sample no longer reads as the
- *   mark either, so a frame caught part-written is left to the completion.
+ *   ones that arrived; the last of them counts only once its last byte no longer reads as the mark
+ *   either, so a frame caught part-written is left to the completion.
  * - A packet is read only once its microframe has been over for CAP_SETTLE_UF microframes (one can
  *   be caught part-written during its microframe), and not if the kernel has already marked it
  *   errored in the transaction list.
@@ -1362,16 +1362,16 @@ static void cap_read_early(void) {
             break;
         }
         /* Count the frames that arrived by the marks: the slots before the first one still all
-           CAP_MARK. None means missing or errored. If the last of them still has its last sample
-           reading as the mark, it may be caught part-way through being written (or, very rarely, be
-           real audio equal to the mark): leave the packet to the completion. The settle time
+           CAP_MARK. None means missing or errored. If the last of them still has its last byte
+           reading as the mark, it may be caught part-way through being written (or, 1 time in 256,
+           be real audio with that byte): leave the packet to the completion. The settle time
            (CAP_SETTLE_UF) is what keeps the early reader clear of a packet still being written. */
         const volatile uint8_t *p = g_cap_bytes[idx] + k * PKT_MAX;
         int n = 0;
         while (n < PKT_MAX / FRAME_BYTES && !cap_slot_unwritten(p + n * FRAME_BYTES)) n++;
         if (n == 0) break;
-        const volatile uint8_t *last = p + n * FRAME_BYTES - SAMPLE_BYTES;
-        if (last[0] == CAP_MARK && last[1] == CAP_MARK && last[2] == CAP_MARK) {
+        const volatile uint8_t *last = p + n * FRAME_BYTES - 1;   /* the frame's last byte */
+        if (*last == CAP_MARK) {
             DBG_DO(atomic_fetch_add_explicit(&dbg_er_torn, 1, memory_order_relaxed));
             break;
         }
