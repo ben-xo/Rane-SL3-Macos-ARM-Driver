@@ -21,7 +21,7 @@ api:
 	$(CC) $(ARCH) -dynamiclib $(CFLAGS) -install_name /Library/Frameworks/Sl3Api.framework/Versions/A/Sl3Api -current_version $(VERSION) -compatibility_version 1.0.0 -framework Foundation -framework CoreAudio -framework IOKit tools/Sl3Api.m -o Sl3Api
 
 panel:
-	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio -framework IOKit tools/sl3panel.m -o sl3panel
+	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio -framework IOKit -Itools tools/sl3panel.m tools/SL3Passthrough.m -o sl3panel
 
 # sl3apitest: checks Sl3Api as Serato DJ Pro 2.5.5 uses it (run the x86_64 slice with arch -x86_64)
 apitest:

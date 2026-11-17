@@ -1,233 +1,220 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * sl3panel: Native Apple Silicon (arm64) CLI control panel for the Rane SL3.
- * Uses IOUSBHost directly (no libusb required) and implements the full
- * reverse-engineered Rane SL3 control protocol from Sl3Api.framework &
- * SL 3 Audio Control Panel.prefPane.
+ * sl3panel.m — Rane SL 3 status and control from the command line
+ *
+ * Works while CoreAudio / Serato is streaming: everything goes through the SL3Device HAL plug-in
+ * ('sl3s' status, 'sl3h' commands, 'sl3i' input safety offset), which holds the box.
+ *
+ *   sl3panel [status]                    the box's and the driver's state
+ *   sl3panel usb|thru [aux|left|right]   each deck's (or one deck's) output: USB audio or analogue thru
+ *   sl3panel sens aux|left|right <mV>    a deck's phono sensitivity, 2.5-10 mV in 0.5 mV steps
+ *                                        (kept in the box's EEPROM, as Rane's control panel does)
+ *   sl3panel sr 44100|48000              the sample rate (through CoreAudio, so the HAL follows)
+ *   sl3panel safety [ms]                 the input safety offset setting
  */
 #import <Foundation/Foundation.h>
+#import <CoreAudio/CoreAudio.h>
 #import <IOKit/IOKitLib.h>
-#import <IOUSBHost/IOUSBHost.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
+#import <IOKit/usb/IOUSBLib.h>
+#import "SL3Passthrough.h"
 
-#define VID 0x1cc5
-#define PID 0x0001
-#define IF_HID 3
-#define EP_HID_OUT 0x01
-#define EP_HID_IN  0x81
-#define HID_REPORT 64
+#ifndef SL3_VERSION
+#define SL3_VERSION  "1.3.0"
+#endif
+#define kSL3PropStatus      'sl3s'
+#define kSL3PropInSafety    'sl3i'
 
-static uint32_t g_seq = 1;
+/* The control block: a block of six per deck, Aux, Left, Right (docs/SL3-COMMANDS.md). */
+#define CTL_LINE_PHONO(d)   (d)                    /* 0-2 */
+#define CTL_SENSITIVITY(d)  (3 + 6 * (d))          /* 3, 9, 15 */
+#define CTL_SOURCE(d)       (3 + 6 * (d) + 5)      /* 8, 14, 20: 1 = USB, 0 = thru */
+#define CTL_EXT_POWER       21
+static const char *const kDeckNames[3] = { "aux", "left", "right" };
+static const char *const kDeckLabels[3] = { "Aux       ", "Left Deck ", "Right Deck" };
 
-static io_service_t usb_find(const char *cls, int ifnum) {
-    CFMutableDictionaryRef m = IOServiceMatching(cls);
-    NSMutableDictionary *p = [@{@"idVendor": @VID, @"idProduct": @PID} mutableCopy];
-    if (ifnum >= 0) p[@"bInterfaceNumber"] = @(ifnum);
-    CFDictionarySetValue(m, CFSTR(kIOPropertyMatchKey), (__bridge CFDictionaryRef)p);
-    return IOServiceGetMatchingService(kIOMainPortDefault, m);
+/* The driver's status ('sl3s'); must match SL3Device.m */
+typedef struct {
+    uint32_t connected;
+    uint32_t streaming;
+    uint32_t sample_rate;
+    uint32_t version_maj;
+    uint32_t version_min;
+    uint8_t  serial[32];
+    uint8_t  phono[4];       /* [Aux, Left, Right]: 1 = Phono */
+    uint8_t  thru[4];        /* [Aux, Left, Right]: 1 = analogue thru */
+    uint8_t  port_a;
+    uint8_t  port_b;
+    uint64_t cap_frames;
+    uint64_t play_frames;
+    uint32_t boot_mode;
+    uint32_t debug_build;
+    uint32_t in_safety_us;
+    uint32_t early_read;
+    uint32_t hub_depth;
+    uint64_t in_dropouts;
+    uint8_t  overload[6];
+    uint8_t  ext_power;
+    uint8_t  usb_state;
+} SL3StatusPacket;
+
+/* An SL 3 is in the USB registry. The driver only lists its device while a box is attached, so this
+   tells "no box" from "driver not loaded". */
+static bool sl3_on_usb(void) {
+    CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!m) return false;
+    int v = 0x1cc5, p = 0x0001;
+    CFNumberRef vn = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    CFNumberRef pn = CFNumberCreate(NULL, kCFNumberIntType, &p);
+    CFDictionarySetValue(m, CFSTR(kUSBVendorID), vn);
+    CFDictionarySetValue(m, CFSTR(kUSBProductID), pn);
+    CFRelease(vn); CFRelease(pn);
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, m);
+    if (!svc) return false;
+    IOObjectRelease(svc);
+    return true;
 }
 
-static int hid_cmd(IOUSBHostPipe *hout, IOUSBHostPipe *hin, NSMutableData *dout, NSMutableData *din,
-                   uint8_t cmd, const uint8_t *payload, int len, uint8_t *reply) {
-    uint8_t *out = dout.mutableBytes;
-    uint32_t seq = g_seq++;
-    memset(out, 0, HID_REPORT);
-    out[0] = cmd;
-    memcpy(out + 1, &seq, 4);
-    if (len > 0) memcpy(out + 5, payload, len);
-
-    NSUInteger sent = 0;
-    NSError *err = nil;
-    if (![hout sendIORequestWithData:dout bytesTransferred:&sent completionTimeout:0 error:&err]) {
-        fprintf(stderr, "Error enviando comando 0x%02x: %s\n", cmd, err ? err.localizedDescription.UTF8String : "desconocido");
-        return -1;
-    }
-
-    for (int tries = 0; tries < 20; tries++) {
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        __block IOReturn st = kIOReturnError;
-        __block NSUInteger got = 0;
-        if (![hin enqueueIORequestWithData:din completionTimeout:0 error:&err
-                         completionHandler:^(IOReturn s2, NSUInteger n2) {
-                             st = s2; got = n2;
-                             dispatch_semaphore_signal(sem);
-                         }]) {
-            return -1;
-        }
-        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC))) {
-            [hin abortWithError:nil];
-            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        }
-        if (st != kIOReturnSuccess || got < 5) continue;
-        memcpy(reply, din.bytes, HID_REPORT);
-        uint32_t rseq = 0;
-        memcpy(&rseq, reply + 1, 4);
-        if (reply[0] == cmd && rseq == seq) return 0;
-    }
+static int deck_index(const char *name) {
+    for (int d = 0; d < 3; d++) if (strcmp(name, kDeckNames[d]) == 0) return d;
     return -1;
 }
 
-static double idx_to_mv(uint8_t idx) {
-    if (idx > 15) idx = 15;
-    return (double)idx * 0.5 + 2.5;
+static void print_status(AudioObjectID dev) {
+    /* Read the driver's status ('sl3s'). */
+    AudioObjectPropertyAddress a = { kSL3PropStatus, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    CFDataRef d = NULL;
+    UInt32 sz = sizeof(d);
+    if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &d) != noErr || !d) {
+        printf("Error: Could not read SL 3 status from CoreAudio HAL.\n");
+        return;
+    }
+    SL3StatusPacket s;
+    memset(&s, 0, sizeof s);
+    CFIndex n = CFDataGetLength(d);
+    memcpy(&s, CFDataGetBytePtr(d), (size_t)(n < (CFIndex)sizeof s ? n : (CFIndex)sizeof s));
+    CFRelease(d);
+
+    /* Print it; a box with no firmware running has no other status to show. */
+    printf("==================================================\n");
+    printf("  Rane SL 3 — Hardware & CoreAudio Status\n");
+    printf("==================================================\n");
+    printf("  USB Connected : %s\n", s.connected ? "YES" : "NO");
+    printf("  Driver Build  : %s\n", s.debug_build ? "DEBUG" : "release");
+    if (s.boot_mode) {
+        printf("  Firmware      : NOT RUNNING — the box needs its firmware restored\n");
+        printf("==================================================\n");
+        return;
+    }
+    printf("  Streaming I/O : %s\n", s.streaming ? "ACTIVE" : "IDLE");
+    printf("  Sample Rate   : %u Hz\n", s.sample_rate);
+    printf("  Firmware Ver  : %u.%02u\n", s.version_maj, s.version_min);
+    printf("  USB Link      : %s\n", s.usb_state == 2 ? "high speed" : s.usb_state == 1 ? "FULL SPEED (no audio: use a USB 2.0 port)" : "?");
+    /* The phono sensitivities are only in the control block: ask the box. */
+    uint8_t c[SL3_CONTROLS_LEN];
+    bool have_c = s.connected && sl3h_get_controls(dev, c);
+    for (int k = 0; k < 3; k++) {
+        printf("  %s: %s  |  Mode: %-11s", kDeckLabels[k], s.phono[k] ? "PHONO" : "LINE ", s.thru[k] ? "ANALOG THRU" : "USB AUDIO");
+        if (have_c) printf("  |  Phono sens: %.1f mV", 2.5 + 0.5 * c[CTL_SENSITIVITY(k)]);
+        printf("\n");
+    }
+    printf("  Overload      : %u %u %u %u %u %u\n", s.overload[0], s.overload[1], s.overload[2], s.overload[3], s.overload[4], s.overload[5]);
+    printf("  Ext. Power    : %u\n", s.ext_power);
+    printf("  Captured Frms : %llu\n", s.cap_frames);
+    printf("  Playback Frms : %llu\n", s.play_frames);
+    if (s.in_safety_us) {
+        printf("  Input Safety  : %g ms\n", s.in_safety_us / 1000.0);
+        printf("  Early Read    : %s\n", s.early_read == 1 ? "working" : s.early_read == 2 ? "NOT WORKING (use an input safety offset of 8 ms)" : "not judged yet");
+        printf("  Input Dropouts: %llu\n", s.in_dropouts);
+        printf("  USB Hubs      : %u%s\n", s.hub_depth, s.hub_depth ? "" : " (connected directly)");
+    }
+    printf("==================================================\n");
 }
 
-static int mv_to_idx(double mv) {
-    int idx = (int)llround((mv - 2.5) / 0.5);
-    if (idx < 0) idx = 0;
-    if (idx > 15) idx = 15;
-    return idx;
+static int usage(void) {
+    printf("Usage: sl3panel [status | usb [aux|left|right] | thru [aux|left|right] |\n"
+           "                sens aux|left|right <mV> | sr 44100|48000 | safety [ms]]\n");
+    return 2;
 }
 
-static void print_status(IOUSBHostPipe *hout, IOUSBHostPipe *hin, NSMutableData *dout, NSMutableData *din) {
-    uint8_t reply[HID_REPORT];
-
-    printf("============================================================\n");
-    printf("  Rane SL3 — Panel de Control Nativo Apple Silicon (arm64)\n");
-    printf("============================================================\n");
-
-    if (hid_cmd(hout, hin, dout, din, 0x01, NULL, 0, reply) == 0) {
-        printf("  Firmware SL3:       v%u.%02u\n", reply[5], reply[6]);
-    }
-    if (hid_cmd(hout, hin, dout, din, 0x30, NULL, 0, reply) == 0) {
-        uint16_t rate = ((uint16_t)reply[5] << 8) | reply[6];
-        printf("  Frecuencia actual:  %u Hz\n", rate);
-    }
-    if (hid_cmd(hout, hin, dout, din, 0x35, NULL, 0, reply) == 0) {
-        printf("  Overload (Ch 1-6):  [%u %u | %u %u | %u %u]\n",
-               reply[5], reply[6], reply[7], reply[8], reply[9], reply[10]);
-    }
-    if (hid_cmd(hout, hin, dout, din, 0x32, NULL, 0, reply) == 0) {
-        const uint8_t *c = reply + 5;
-        const char *decks[3] = {"Aux (Ch 1-2)       ", "Left Deck (Ch 3-4) ", "Right Deck (Ch 5-6)"};
-        const int sens_idx[3] = {3, 9, 15};
-        const int sw_idx[3]   = {8, 14, 20};
-        printf("------------------------------------------------------------\n");
-        printf("  Deck                 Switch Físico   Sensibilidad Phono   Salida\n");
-        printf("------------------------------------------------------------\n");
-        for (int i = 0; i < 3; i++) {
-            uint8_t phono = c[i];
-            uint8_t sens  = c[sens_idx[i]];
-            uint8_t outsw = c[sw_idx[i]];
-            printf("  %s  %-14s  %4.1f mV (idx %2u)     %s\n",
-                   decks[i],
-                   phono ? "PHONO" : "LINE / CD",
-                   idx_to_mv(sens), sens,
-                   outsw ? "USB Audio (01)" : "Analog Thru (00)");
-        }
-        printf("------------------------------------------------------------\n");
-        printf("  Bloque raw (22B):   ");
-        for (int i = 0; i < 22; i++) {
-            printf("%s%02x", (i == 3 || i == 9 || i == 15 || i == 21) ? " | " : (i ? " " : ""), c[i]);
-        }
-        printf("\n============================================================\n");
-    }
-}
-
-static void usage(const char *prog) {
-    fprintf(stderr,
-        "Uso: %s [opciones]\n"
-        "  status                         Muestra estado completo de la Rane SL3 (por defecto)\n"
-        "  --rate <44100|48000>           Cambia la frecuencia de muestreo (cmd 0x31)\n"
-        "  --left-sens <2.5..10.0>        Sensibilidad Phono Left Deck en mV (pasos de 0.5 mV)\n"
-        "  --right-sens <2.5..10.0>       Sensibilidad Phono Right Deck en mV (pasos de 0.5 mV)\n"
-        "  --aux-sens <2.5..10.0>         Sensibilidad Phono Aux en mV (pasos de 0.5 mV)\n"
-        "  --left-mode <usb|thru>         Conmutador de salida Left Deck (offset 14)\n"
-        "  --right-mode <usb|thru>        Conmutador de salida Right Deck (offset 20)\n"
-        "  --aux-mode <usb|thru>          Conmutador de salida Aux (offset 8)\n",
-        prog);
-}
-
-int main(int argc, char **argv) {
+int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        for (int i = 1; i < argc; i++) {
-            if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-                usage(argv[0]);
-                return 0;
+        if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0)) {
+            printf("sl3panel %s\n", SL3_VERSION);
+            return 0;
+        }
+        /* Find the driver's device; without it, say whether a box is attached at all. */
+        AudioObjectID dev = sl3h_find_device();
+        if (dev == kAudioObjectUnknown) {
+            if (sl3_on_usb())
+                printf("Error: an SL 3 is connected, but the SL 3 CoreAudio driver is not loaded in coreaudiod.\n");
+            else
+                printf("No SL 3 connected.\n");
+            return 1;
+        }
+        /* No command, or "status": print the status. */
+        if (argc < 2 || strcmp(argv[1], "status") == 0) {
+            print_status(dev);
+            return 0;
+        }
+        /* "usb" / "thru" [deck]: each deck's output source byte (1 = USB audio, 0 = analogue thru). */
+        if (strcmp(argv[1], "usb") == 0 || strcmp(argv[1], "thru") == 0) {
+            int only = argc >= 3 ? deck_index(argv[2]) : -1;
+            if (argc >= 3 && only < 0) return usage();
+            uint8_t v = strcmp(argv[1], "usb") == 0 ? 1 : 0;
+            for (int k = 0; k < 3; k++) {
+                if (only >= 0 && k != only) continue;
+                if (!sl3h_set_controls(dev, CTL_SOURCE(k), 1, &v)) { printf("Error: the box did not answer.\n"); return 1; }
+                printf("%s: %s\n", kDeckLabels[k], v ? "USB audio" : "analogue thru");
             }
-        }
-
-        io_service_t dsvc = usb_find("IOUSBHostDevice", -1);
-        if (!dsvc) {
-            fprintf(stderr, "Rane SL3 (1cc5:0001) no detectada por USB. Conéctala y asegúrate de darle alimentación.\n");
-            return 1;
-        }
-        dispatch_queue_t q = dispatch_queue_create("sl3.panel", DISPATCH_QUEUE_SERIAL);
-        io_service_t isvc = usb_find("IOUSBHostInterface", IF_HID);
-        if (!isvc) {
-            NSError *cfgErr = nil;
-            IOUSBHostDevice *dev = [[IOUSBHostDevice alloc] initWithIOService:dsvc options:IOUSBHostObjectInitOptionsNone queue:q error:&cfgErr interestHandler:nil];
-            if (!dev || ![dev configureWithValue:1 matchInterfaces:YES error:&cfgErr]) {
-                fprintf(stderr, "No se pudo activar la configuración USB 1: %s\n", cfgErr ? cfgErr.localizedDescription.UTF8String : "error");
-                IOObjectRelease(dsvc);
-                return 1;
-            }
-            [dev destroy];
-            for (int i = 0; i < 30 && !(isvc = usb_find("IOUSBHostInterface", IF_HID)); i++) usleep(100000);
-        }
-        IOObjectRelease(dsvc);
-        if (!isvc) {
-            fprintf(stderr, "Interfaz 3 de la Rane SL3 no disponible.\n");
-            return 1;
-        }
-        NSError *err = nil;
-        IOUSBHostInterface *hid = [[IOUSBHostInterface alloc] initWithIOService:isvc
-                                                                        options:IOUSBHostObjectInitOptionsNone
-                                                                          queue:q
-                                                                          error:&err
-                                                                interestHandler:nil];
-        IOObjectRelease(isvc);
-        if (!hid) {
-            fprintf(stderr, "No se pudo abrir la interfaz 3 (¿está en uso por otro proceso?): %s\n",
-                    err ? err.localizedDescription.UTF8String : "error");
-            return 1;
-        }
-
-        IOUSBHostPipe *hout = [hid copyPipeWithAddress:EP_HID_OUT error:&err];
-        IOUSBHostPipe *hin  = [hid copyPipeWithAddress:EP_HID_IN error:&err];
-        NSMutableData *dout = [hid ioDataWithCapacity:HID_REPORT error:&err];
-        NSMutableData *din  = [hid ioDataWithCapacity:HID_REPORT error:&err];
-        if (!hout || !hin || !dout || !din) {
-            fprintf(stderr, "Error inicializando pipes HID.\n");
-            [hid destroy];
-            return 1;
-        }
-
-        uint8_t reply[HID_REPORT];
-        for (int i = 1; i < argc; i++) {
-            if (!strcmp(argv[i], "status")) {
-                continue;
-            } else if (!strcmp(argv[i], "--rate") && i + 1 < argc) {
-                int rate = atoi(argv[++i]);
-                if (rate != 44100 && rate != 48000) {
-                    fprintf(stderr, "Frecuencia inválida: usa 44100 o 48000.\n");
-                } else {
-                    uint8_t p[2] = {(uint8_t)(rate >> 8), (uint8_t)(rate & 0xff)};
-                    hid_cmd(hout, hin, dout, din, 0x31, p, 2, reply);
+        /* "sens" deck mV: the phono sensitivity, 0-15 for 2.5-10 mV. */
+        } else if (strcmp(argv[1], "sens") == 0 && argc >= 4) {
+            int k = deck_index(argv[2]);
+            double mv = atof(argv[3]);
+            int step = (int)lround((mv - 2.5) / 0.5);
+            if (k < 0 || step < 0 || step > 15) return usage();
+            uint8_t v = (uint8_t)step;
+            if (!sl3h_set_controls(dev, CTL_SENSITIVITY(k), 1, &v)) { printf("Error: the box did not answer.\n"); return 1; }
+            printf("%s: phono sensitivity %.1f mV\n", kDeckLabels[k], 2.5 + 0.5 * step);
+        /* "sr": set the rate through CoreAudio, which changes the box's rate with it. */
+        } else if (strcmp(argv[1], "sr") == 0 && argc >= 3) {
+            Float64 sr = atof(argv[2]);
+            AudioObjectPropertyAddress a = {
+                kAudioDevicePropertyNominalSampleRate,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            if (AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof(Float64), &sr)) { printf("Refused: 44100 or 48000.\n"); return 1; }
+            printf("Set Sample Rate to %.0f Hz.\n", sr);
+        } else if (strcmp(argv[1], "safety") == 0) {
+            /* "safety [ms]": the input safety offset setting. The driver takes it only with nothing
+               streaming, and sets the device up again with it (about half a second). */
+            AudioObjectPropertyAddress a = { kSL3PropInSafety, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+            if (argc >= 3) {
+                int us = (int)lround(atof(argv[2]) * 1000.0);
+                CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &us);
+                OSStatus e = AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof n, &n);
+                CFRelease(n);
+                if (e) {
+                    printf("Refused (error %d): the setting must be 0.5 to 20 ms, with nothing streaming.\n", (int)e);
+                    return 1;
                 }
-            } else if ((!strcmp(argv[i], "--aux-sens") || !strcmp(argv[i], "--left-sens") || !strcmp(argv[i], "--right-sens")) && i + 1 < argc) {
-                uint8_t offset = !strcmp(argv[i], "--aux-sens") ? 3 : (!strcmp(argv[i], "--left-sens") ? 9 : 15);
-                double mv = atof(argv[++i]);
-                uint8_t idx = (uint8_t)mv_to_idx(mv);
-                uint8_t p[3] = {offset, 1, idx};
-                hid_cmd(hout, hin, dout, din, 0x33, p, 3, reply);
-            } else if ((!strcmp(argv[i], "--aux-mode") || !strcmp(argv[i], "--left-mode") || !strcmp(argv[i], "--right-mode")) && i + 1 < argc) {
-                uint8_t offset = !strcmp(argv[i], "--aux-mode") ? 8 : (!strcmp(argv[i], "--left-mode") ? 14 : 20);
-                uint8_t val = !strcasecmp(argv[++i], "usb") ? 1 : 0;
-                uint8_t p[3] = {offset, 1, val};
-                hid_cmd(hout, hin, dout, din, 0x33, p, 3, reply);
+                printf("Input safety offset setting: %g ms.\n", us / 1000.0);
             } else {
-                usage(argv[0]);
-                [hid destroy];
-                return 2;
+                CFNumberRef n = NULL;
+                UInt32 sz = sizeof n;
+                int us = 0;
+                if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &n) || !n) {
+                    printf("This driver has no input safety offset setting.\n");
+                    return 1;
+                }
+                CFNumberGetValue(n, kCFNumberIntType, &us);
+                CFRelease(n);
+                printf("Input safety offset setting: %g ms.\n", us / 1000.0);
             }
+        } else {
+            /* LINE/PHONO is a physical switch per deck: reported in the status, not settable */
+            return usage();
         }
-
-        print_status(hout, hin, dout, din);
-        [hid destroy];
     }
     return 0;
 }
