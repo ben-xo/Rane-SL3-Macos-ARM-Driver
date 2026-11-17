@@ -560,6 +560,8 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
   after the wake the driver logged "a deck was on USB audio with nothing streaming: back to thru" and "the
   box was at 44100 Hz: set to 48000 Hz", as the 2.31 firmware's DSP boot predicts. `make hwtest` has a
   step for it (skipped while something holds a PreventSystemSleep assertion, as Internet Sharing does).
+- **The release build** (`make install`): on firmware 2.50 the box-only tests pass, a 60 s glitch test is
+  clean, the round trip at 48 frames / 48 kHz is 8.6 ms (the debug build's), and it logs no `DBG` lines.
 - **Firmware 2.50**: the box tested was updated from 2.31 with `sl3flash` (verified against Rane's image,
   phono sensitivities kept). On 2.50 the full `make hwtest ARGS="--loopback"` passes, 24 of 24 (the same
   round trips as on 2.31: 8.5 ms at 48 frames / 48 kHz; the Mac sleep step included), and the `0x39` thru
@@ -575,8 +577,10 @@ repository's history holds the OpenSL3 driver this one replaced, and the OpenSL3
 - **The firmware tools** (`tools/firmware/`) have not been run on an SL 3.
 - **Serato DJ Pro 4.x / 5.x**: works (tested by hand on an SL 3
   with firmware 2.31, 2026-11-17; Serato uses the driver directly, not Sl3Api).
-- **One missed millisecond of capture with Serato** (see §8): whether the box's overload reports, about 30 a
-  second while a flag toggles, can delay the capture completions on the shared USB queue. The overload
-  flags' mapping to channels is also unknown.
+- **One missed millisecond of capture with Serato** (see §8), cause unknown. Not HID traffic: 60 s glitch
+  tests with 100 and then 500 harmless HID queries a second through the driver (`0x0a`, `0x35`; far more
+  than the overload reports' ~30 a second) had no glitch, no capture gap and no input dropout, with capture
+  completions no later than usual (8.5 ms at most). A lead not followed: two capture completions delivered
+  out of order would show as exactly this (the later one fills the earlier frame with silence).
 - The output side (2 ms safety offset + 1.5 ms output latency) is set by the 1 ms write guard and 1 ms
   transfers; shorter transfers or a smaller guard might save up to ~1 ms. Untested on either box.

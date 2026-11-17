@@ -5,7 +5,8 @@ All notable changes to the Rane SL3 macOS ARM Driver project are documented in t
 ## [Unreleased]
 
 The SL 2 driver's work (pepeleedj/Rane-SL2-Macos-ARM-Driver v1.3.0) ported to the SL 3, and tested on an
-SL 3 with firmware 2.31 and 2.50 (debug build): `make hwtest ARGS="--loopback"` 24 of 24; Serato DJ Pro
+SL 3 with firmware 2.31 and 2.50 (debug build; the release build's box-only tests and a glitch test too):
+`make hwtest ARGS="--loopback"` 24 of 24; Serato DJ Pro
 2.5.5 with turntables; Serato DJ Pro 4.x / 5.x. An 8.5 ms DVS round trip at Serato's
 1 ms (48-frame) buffer. What is still open is listed in `docs/SL3-AUDIO-ENGINE.md`.
 
