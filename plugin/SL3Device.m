@@ -235,6 +235,7 @@ static bool stream_live(uint32_t gen) {
 static _Atomic bool g_hw_connected = false;
 static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
 static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
+static _Atomic uint64_t g_dev_regid;         /* registry entry ID of the device g_dev opened, 0 if none */
 static uint32_t g_ref_count = 0;
 
 /* Capture ring buffer (Float32 interleaved, NCH channels), indexed by timeline position */
@@ -1775,6 +1776,9 @@ static bool usb_ensure_hid(void) {
         if (!svc) return false;
         g_dev = [[IOUSBHostDevice alloc] initWithIOService:svc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
         g_hid_reconfigured = false;
+        uint64_t rid = 0;
+        IORegistryEntryGetRegistryEntryID(svc, &rid);
+        atomic_store(&g_dev_regid, g_dev ? rid : 0);
         uint32_t hubs = usb_hub_depth(svc);
         atomic_store(&g_hub_depth, hubs);
         if (hubs) LOG("Rane SL 3 is connected through %u USB hub%{public}s", hubs, hubs > 1 ? "s" : "");
@@ -2017,6 +2021,7 @@ static void usb_close_all(void) {
     /* Then the HID interface and the device itself; the next box is opened from scratch. */
     if (g_hid)  { [g_hid destroy]; g_hid = nil; }
     if (g_dev)  { [g_dev destroy]; g_dev = nil; }
+    atomic_store(&g_dev_regid, 0);
     atomic_store(&g_hw_connected, false);
 }
 
@@ -2232,18 +2237,27 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
 
 /* Hot-plug: SL 3 USB devices went away (on the hot-plug queue). */
 static void on_usb_removed(void *refcon, io_iterator_t iter) {
-    /* Drain the iterator (which re-arms it); stop if nothing was actually removed. */
+    /* Drain the iterator (which re-arms it), noting whether the device the driver has open is
+       among the removed (by registry entry ID, which a terminated service still has); stop if
+       nothing was actually removed. */
     io_service_t s;
-    bool removed = false;
-    while ((s = IOIteratorNext(iter))) { IOObjectRelease(s); removed = true; }
+    bool removed = false, ours = false;
+    uint64_t open_id = atomic_load(&g_dev_regid);
+    while ((s = IOIteratorNext(iter))) {
+        uint64_t rid = 0;
+        if (open_id && IORegistryEntryGetRegistryEntryID(s, &rid) == KERN_SUCCESS && rid == open_id) ours = true;
+        IOObjectRelease(s);
+        removed = true;
+    }
     if (!removed) return;
     /* The removed service can no longer be asked what it was: see what is still attached. */
     bool audio, bootloader;
     scan_attached(&audio, &bootloader);
     bool was_published = device_published();
 
-    /* The box with firmware is gone: close everything that was open on it. */
-    if (!audio && atomic_load(&g_box_present)) {
+    /* The box with firmware is gone, or the device the driver has open is (a replug that arrived
+       before this ran leaves a new box attached): close everything that was open on it. */
+    if ((!audio || ours) && atomic_load(&g_box_present)) {
         LOG("Rane SL 3 USB disconnected");
         atomic_store(&g_box_present, false);
         pthread_mutex_lock(&g_mutex);
@@ -2260,6 +2274,15 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         if (g_io_clients) LOG("%u client(s) were streaming when the box was unplugged", g_io_clients);
         g_io_clients = 0;
         pthread_mutex_unlock(&g_mutex);
+        /* A box is attached again already: open it (its arrival may have been handled before this
+           removal, against the old device's handles). */
+        if (audio) {
+            atomic_store(&g_early_state, EARLY_UNKNOWN);
+            atomic_store(&g_in_dropouts, 0);
+            atomic_store(&g_box_present, true);
+            LOG("Rane SL 3 USB connected again before its removal was handled: opening the new one");
+            connect_box(0);
+        }
     }
     /* Boot mode follows what is still attached (a box with no firmware, or Rane's loader, known by
        its version); tell the HAL if the device left its list. */

@@ -528,6 +528,15 @@ setting or early read (44), and the heartbeat below.
       the queue is serial, so no `dp_start` can run between the two.
     - Test: `make hwtest` (restarts, rate changes and the mid-stream replug stop streams); the window itself
       is too narrow to hit on purpose.
+18. **A replug that arrived before the unplug was handled left the old box's handles open.**
+    - Cause: the removal handler can't ask a removed service what it was, so it decided from what was still
+      attached: with a box attached again (the hot-plug queue busy with a settle check, a retry or a HID
+      timeout while the box was replugged), it closed nothing, and the open device, HID interface and pipes
+      were the departed box's. `usb_ensure_hid` took them as open: commands went to dead pipes and streams
+      failed until the next unplug. Found in a code review.
+    - Fix: the registry entry ID of the device the driver opens is kept (`g_dev_regid`), and the removal
+      handler closes everything when that ID is among the removed, then opens the box that is attached.
+    - Test: `make hwtest`'s replugs (the usual order); the race needs the queue held busy across a replug.
 
 ## Testing
 
