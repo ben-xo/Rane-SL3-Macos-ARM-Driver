@@ -14,6 +14,9 @@ other tools take the device name and channels as arguments):
 SL_DEVICE="SL 3" SL_LOG_SUBSYSTEM=com.rane.sl3 SL_LOOP_CH=3 tools/latency/restartcheck.sh
 ```
 
+`tools/hwtest.sh` reads `SL_LOOP_CH` too (3, the Left deck's left channel, if unset), so the loopback can
+go on any channel, out to in on the same one.
+
 The log lines the scripts look for are the SL 3 driver's (the same as the SL 2 driver's), so they need
 adapting for another driver.
 

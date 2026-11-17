@@ -6,7 +6,8 @@
 #   1. with the box attached, nothing else: driver status, Sl3Api as Serato calls it (both slices),
 #      sample-rate switching, the phono sensitivity, the input safety offset setting, and the early
 #      capture read working;
-#   2. with --loopback (a cable from Left Deck Out L to Left Deck In L, channel 3; the tests play
+#   2. with --loopback (a cable from Left Deck Out L to Left Deck In L, channel 3, or the channel in
+#      SL_LOOP_CH, out to in on the same channel; the tests play
 #      clicks and a loud tone into that output, so pass it only when the cable is in): restarts, a
 #      glitch test (with no 0x37 heartbeat sent), the other sample rate, IO buffer sizes, the output
 #      volume and mute, the level meters, and in a debug build (installed with make install DEBUG=1)
@@ -23,8 +24,10 @@ PANEL="$ROOT/sl3panel"
 APITEST="$ROOT/sl3apitest"
 DEV="SL 3"
 SUBSYS=com.rane.sl3
-LOOP=3                              # the looped-back channel: Left Deck L
-OTHER=4                             # a channel next to it, which nothing plays to
+LOOP=${SL_LOOP_CH:-3}               # the looped-back channel: 3 = Left Deck L (the latency scripts read it too)
+OTHER=$(( LOOP % 2 ? LOOP + 1 : LOOP - 1 ))   # the other side of the same deck, which nothing plays to
+DECKS=("Aux" "Left Deck" "Right Deck")
+LOOP_DECK=${DECKS[$(( (LOOP - 1) / 2 ))]}     # the deck the loopback is on (channels 1-2, 3-4, 5-6)
 WAIT_S=${HWTEST_WAIT:-120}          # how long to wait for a physical step
 
 LOOPBACK=0; PHYSICAL=1
@@ -117,7 +120,7 @@ restore_volume() {
 
 all_thru() { [ "$(status | grep -c 'Mode: ANALOG THRU')" = 3 ]; }
 deck_input_is() { field "$1" | grep -q "^$2"; }   # <Aux|Left Deck|Right Deck> <LINE|PHONO>
-input_is() { deck_input_is 'Left Deck' "$1"; }    # the looped-back deck
+input_is() { deck_input_is "$LOOP_DECK" "$1"; }   # the looped-back deck
 
 # ---------------------------------------------------------------------------- 0. preconditions
 
@@ -225,7 +228,7 @@ else
     # one disturbs its neighbour, so the switches must be left alone while the tests play).
     line_steady() { input_is LINE && sleep 2 && input_is LINE; }
     if ! input_is LINE; then
-        echo "   >>> Set the Left deck's LINE/PHONO switch on the box to LINE, then leave the switches alone"
+        echo "   >>> Set the $LOOP_DECK's LINE/PHONO switch on the box to LINE, then leave the switches alone"
         echo "       until the loopback tests have finished."
         wait_until "the switch steady on LINE" line_steady
     fi
