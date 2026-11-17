@@ -26,6 +26,9 @@ enum SL3Driver {
     static let productID = 0x0001
 
     static let decks = 3
+    /// The newest SL 3 firmware known: 2.50, the image in Rane's last driver (Sl3Api 2.0.1f2); sl3flash
+    /// installs it (tools/firmware/README.md). Boxes in the field run older ones, e.g. 2.31.
+    static let latestFirmware = (major: 2, minor: 50)
     static let channels = 6
 
     // HID commands (plugin/SL3Device.m, SL3_CMD_*). Every command and reply is one 64-byte report:
@@ -252,6 +255,7 @@ struct BoxState: Equatable {
     var streaming: Bool
     var sampleRate: Int
     var firmware: String
+    var firmwareOutdated: Bool   // older than SL3Driver.latestFirmware
     var serial: String
     var phono: [Bool]        // each deck's LINE/PHONO switch: true = Phono
     var thru: [Bool]         // each deck's output source: true = analogue thru
@@ -386,6 +390,8 @@ final class PanelModel: ObservableObject {
             streaming: s.streaming != 0,
             sampleRate: Int(s.sample_rate),
             firmware: s.version_maj == 0 && s.version_min == 0 ? "—" : String(format: "%u.%02u", s.version_maj, s.version_min),
+            firmwareOutdated: (s.version_maj != 0 || s.version_min != 0) &&
+                (Int(s.version_maj), Int(s.version_min)) < SL3Driver.latestFirmware,
             serial: serial.isEmpty ? "—" : serial,
             phono: phono.map { $0 != 0 },
             thru: thru.map { $0 != 0 },
@@ -620,7 +626,15 @@ struct PanelView: View {
     private func boxSections(_ box: BoxState) -> some View {
         Section("Rane SL 3") {
             LabeledContent("Status", value: box.streaming ? "Connected, streaming audio" : "Connected")
-            LabeledContent("Firmware", value: box.firmware)
+            // The firmware in red if it's older than the newest known, which is shown beside it.
+            LabeledContent("Firmware") {
+                if box.firmwareOutdated {
+                    (Text(box.firmware).foregroundColor(.red) +
+                     Text(String(format: " (latest known: %d.%02d)", SL3Driver.latestFirmware.major, SL3Driver.latestFirmware.minor)))
+                } else {
+                    Text(box.firmware)
+                }
+            }
             LabeledContent("Serial number", value: box.serial)
             LabeledContent("Driver", value: model.driverVersion ?? "—")
             if let input = box.input {
