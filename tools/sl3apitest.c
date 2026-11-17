@@ -29,6 +29,7 @@ static int (*sl3_get_usb_port_status)(void *, sl3_usb_port_status_t *);
 static int (*sl3_get_audio_controls)(void *, int, uint8_t *, int);
 static int (*sl3_set_audio_controls)(void *, int, const uint8_t *, int);
 static int (*sl3_set_thrustate_callback)(void *, void (*)(sl3_thrustate_status_data *));
+static int (*sl3_get_firmware_version)(void *, uint32_t v[4]);   /* not one of Serato's seven */
 
 // Serato's decks and the control byte that holds each one's output source (1 = USB, 0 = thru).
 static const struct { const char *name; int offset; } kDecks[3] = { { "left", 14 }, { "right", 20 }, { "aux", 8 } };
@@ -101,6 +102,7 @@ int main(int argc, char **argv) {
     sl3_get_audio_controls = dlsym(lib, "sl3_get_audio_controls");
     sl3_set_audio_controls = dlsym(lib, "sl3_set_audio_controls");
     sl3_set_thrustate_callback = dlsym(lib, "sl3_set_thrustate_callback");
+    sl3_get_firmware_version = dlsym(lib, "sl3_get_firmware_version");
     check(sl3_open && sl3_close && sl3_driver_timer && sl3_get_usb_port_status && sl3_get_audio_controls &&
           sl3_set_audio_controls && sl3_set_thrustate_callback, "all seven functions Serato uses are exported");
     if (g_failed) return 1;
@@ -144,8 +146,17 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&g_mtx);
     int reports = g_thru_reports - reports_before;
     pthread_mutex_unlock(&g_mtx);
-    snprintf(what, sizeof what, "the thru callback was called for the changes (%d reports)", reports);
-    check(reports > 0, what);
+    /* The box confirms a change of output source with a 0x39 report from firmware 2.50; 2.31 has no
+       such report, so with it the callback stays silent (as with Rane's own library). */
+    uint32_t fw[4] = { 0 };
+    bool reports_expected = !sl3_get_firmware_version || sl3_get_firmware_version(h, fw) != SL3_OK ||
+                            (fw[0] << 8 | fw[1]) >= (2 << 8 | 50);
+    if (reports_expected) {
+        snprintf(what, sizeof what, "the thru callback was called for the changes (%d reports)", reports);
+        check(reports > 0, what);
+    } else {
+        printf("SKIP  the thru callback (firmware %u.%02u sends no thru reports; %d seen)\n", fw[0], fw[1], reports);
+    }
 
     // Close; Serato never does, but the control panel does.
     sl3_close(h);
