@@ -24,9 +24,10 @@ When Apple transitioned to **Apple Silicon (M1 / M2 / M3 / M4)** and modern macO
 
 * ✅ **Works natively with Serato DJ Pro 2.5.5** (the last Serato version that supports the Rane SL3 hardware—unlocks DVS `ABS` / `REL` / `INT` modes and `THRU` control).
 * ✅ **NO SIP Disable Required & NO Reboot Required:** Runs 100% in user space via Apple's modern `AudioServerPlugIn` (CoreAudio HAL) and `IOUSBHost` frameworks, plus a custom Universal `Sl3Api.framework` user-space bridge.
-* ✅ **Works with the macOS System Settings "SL 3" Control Panel** and includes a terminal control utility (`sl3panel`) to switch between **Phono / Line**, toggle **Thru**, and change sample rates (**44.1 kHz / 48 kHz**).
-* ✅ **Works as a 6-In / 6-Out (24-bit) CoreAudio Soundcard** in **Mixxx, Traktor, Ableton Live, Rekordbox, Logic Pro**, and system-wide macOS audio.
-* ✅ **Ultra-Low-Latency Audio Engine (~9–15 ms DVS Round-Trip):** Deep-scheduled isochronous USB playback with late writes directly from `WriteMix`, low-latency capture (`IN_SAFETY = 4 ms`, `OUT_SAFETY = 3 ms`), native macOS master + 6-channel volume/mute controls (`-64 dB` to `0 dB` with click-free ramping), and seamless USB hot-plug reconnect.
+* ✅ **Includes the SL 3 Control Panel app** (in Applications, macOS 13+) and a terminal control utility (`sl3panel`) to show each deck's **Phono / Line** switch (one per deck on the SL 3), toggle **Thru** per deck, set the **phono sensitivity**, and change sample rates (**44.1 kHz / 48 kHz**; 48 kHz by default, as Serato uses it).
+* ✅ **Works as a 6-In / 6-Out (24-bit) CoreAudio Soundcard** in **Mixxx, Traktor, Ableton Live, Rekordbox, Logic Pro**, and system-wide macOS audio: channels 1–2 Aux, 3–4 Left deck, 5–6 Right deck.
+* ✅ **Low-latency DVS engine, shared with the Rane SL 2 driver:** deep-scheduled late-write playback and early-read capture (`docs/SL3-AUDIO-ENGINE.md`). On the SL 2 it measures a ~9.3 ms DVS round trip at 64 frames; the SL 3's figures are still to be measured.
+* ✅ **Output volume and mute** from the menu bar and the volume keys, and per channel in Audio MIDI Setup (the SL 3 has no volume control of its own, so the driver provides one). It applies to everything the SL 3 plays, **Serato's decks included**, and macOS remembers it: if your decks sound quiet in Serato, check the SL 3's volume.
 
 ---
 
@@ -65,9 +66,10 @@ Con la llegada de los procesadores **Apple Silicon (M1 / M2 / M3 / M4)** y los n
 
 * ✅ **Funciona nativamente con Serato DJ Pro 2.5.5** (la última versión de Serato compatible con Rane SL3; activa los modos DVS `ABS` / `REL` / `INT` y `THRU`).
 * ✅ **SIN desactivar la seguridad del Mac (SIP) y SIN reiniciar:** Todo funciona en espacio de usuario mediante un plugin HAL de CoreAudio (`SL3Device.driver` sobre `IOUSBHost`) junto con un puente nativo Universal (`Sl3Api.framework`).
-* ✅ **Funciona con el panel "SL 3" en Ajustes del Sistema de macOS** e incluye utilidad de control (`Panel-Control-SL3.command` / `sl3panel`) para cambiar entre **Phono / Line**, activar/desactivar **Thru** y elegir entre **44.1 kHz y 48 kHz**.
+* ✅ **Incluye la app SL 3 Control Panel** (en Aplicaciones, macOS 13+) y la utilidad de control (`Panel-Control-SL3.command` / `sl3panel`) para ver el selector **Phono / Line** de cada plato, activar/desactivar **Thru** por plato, ajustar la **sensibilidad phono** y elegir entre **44.1 kHz y 48 kHz** (48 kHz por defecto).
 * ✅ **Funciona como tarjeta de sonido de 6 Entradas y 6 Salidas (24-bit)** en **Ableton Live, Traktor, Mixxx, Rekordbox, Logic Pro** y el audio general de macOS.
-* ✅ **Motor de Audio de Ultra-Baja Latencia (~9–15 ms DVS Round-Trip):** Escritura tardía (`late-write`) directa sobre transferencias USB isócronas desde `WriteMix`, captura de baja latencia, control nativo de volumen/mute en macOS (Master + 6 canales con rampa sin clics) y reconexión USB en caliente (`hot-plug`).
+* ✅ **Motor de audio de baja latencia, compartido con el driver de la Rane SL 2** (escritura tardía y lectura anticipada de la captura; en la SL 2 mide ~9.3 ms de ida y vuelta DVS a 64 frames; las cifras de la SL 3 están por medir).
+* ✅ **Volumen y silencio de salida** desde la barra de menús y las teclas de volumen, y por canal en Configuración de Audio MIDI. Afecta a todo lo que suena por la SL 3, **incluidos los platos de Serato**: si suenan bajos en Serato, revisa el volumen de la SL 3.
 
 ---
 
@@ -88,9 +90,9 @@ Tienes dos formas de instalarlo (ambas instalan exactamente lo mismo y **NO requ
 * Conecta tu Rane SL3 por USB y abre Serato DJ Pro 2.5.5: detectará la tarjeta al instante y activará los dos platos con control por vinilo/CDJ (DVS).
 
 #### Canales de Audio (6 Entradas / 6 Salidas a 24-bit, 44.1 / 48 kHz)
-* **Canales 1–2:** Left Deck (Plato / CDJ Izquierdo)
-* **Canales 3–4:** Right Deck (Plato / CDJ Derecho)
-* **Canales 5–6:** Aux (Entrada / Salida Auxiliar)
+* **Canales 1–2:** Aux (Entrada / Salida Auxiliar)
+* **Canales 3–4:** Left Deck (Plato / CDJ Izquierdo)
+* **Canales 5–6:** Right Deck (Plato / CDJ Derecho)
 
 ---
 
@@ -104,16 +106,22 @@ Tienes dos formas de instalarlo (ambas instalan exactamente lo mismo y **NO requ
 ### 🛠️ Compilar desde el código fuente / Build from Source
 Requires Xcode Command Line Tools (`xcode-select --install`):
 ```bash
-make
+make            # the driver, Sl3Api, sl3panel, sl3dump, sl3flash and the SL 3 Control Panel app
+make install    # install a built driver over the installed package (DEBUG=1 for a debug build)
+make package    # the installer package and zip, into build/
+make hwtest ARGS="--loopback"   # the hardware tests (see tools/latency/README.md)
 ```
-* `plugin/SL3Device.m`: CoreAudio HAL AudioServerPlugIn (`SL3Device.driver`) with shared IPC control/status state.
-* `tools/Sl3Api.m`: Replacement `Sl3Api.framework` (`C Sl3Api` C++ ABI bridge) for Serato DJ Pro 2.5.5 & System Settings preference pane.
-* `tools/sl3panel.m`: CLI & interactive control panel for Phono/Line, Thru, and sample rate switching.
+* `plugin/SL3Device.m`: the CoreAudio HAL AudioServerPlugIn (`SL3Device.driver`), driving the box over IOUSBHost.
+* `tools/Sl3Api.m`: replacement `Sl3Api.framework`, matching Rane's 2.0.1f2, for Serato DJ Pro 2.5.5.
+* `tools/sl3panel.m`, `tools/controlpanel/`: status and control, in Terminal and as an app.
+* `tools/firmware/`, `tools/sl3dump.m`: firmware extraction from Rane's driver, over-USB flashing (not yet tested on an SL 3), EEPROM backup.
+* `tools/latency/`, `tools/hwtest.sh`: latency, glitch and hardware tests.
+* Docs: `docs/SL3-AUDIO-ENGINE.md` (design and bug catalogue), `docs/SL3-COMMANDS.md` (the box's protocol), `AGENTS.md` (for contributors).
 
 ---
 
 ### 🙌 Créditos y Licencia / Credits & License
 * **Idea original, puente Serato (`Sl3Api.framework`), utilidad `sl3panel` e instalador macOS Universal:** **pepelee (PPLEE)** — Instagram: [@pepeleedj](https://www.instagram.com/pepeleedj/)
-* **Arquitectura de baja latencia (`WriteMix` late-write, controles de volumen/mute CoreAudio, hot-plug):** **Ben XO** — GitHub: [@ben-xo](https://github.com/ben-xo)
+* **Motor de audio de baja latencia (del driver de la SL 2), controles de volumen/mute, `SL 3 Control Panel.app`, herramientas de firmware, pruebas de hardware y documentación del protocolo:** **Ben XO** — GitHub: [@ben-xo](https://github.com/ben-xo)
 * **Base User-Space CoreAudio HAL Plugin (`OpenSL3`):** Basado en el proyecto open-source [OpenSL3](https://github.com/mrbrainz/OpenSL3) bajo licencia [GPL-3.0-or-later](LICENSE).
 * *Disclaimer:* Proyecto independiente no afiliado con Rane ni Serato. "Rane", "SL3" y "Serato" son marcas registradas de sus respectivos propietarios.
