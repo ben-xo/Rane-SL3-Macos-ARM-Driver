@@ -141,15 +141,25 @@ here, which counts twice in the round trip; the input safety offset (counted onc
     completion out of the queued buffers and places them in the ring itself (`cap_read_early`), once
     their microframe has been over for one more microframe (a packet can be caught part-written during
     its own).
-  - A packet's frame count is only reported with its completion, so each buffer is filled with a mark
-    byte (`0xA5`) before it is queued, and a frame slot whose 18 bytes still all read `0xA5` has not been
-    written. The frames before the first such slot are the ones that arrived; the last of them counts only
-    once its last sample no longer reads as the mark, so a frame caught part-written is left to the
-    completion. (The SL 2 marks with `0xFF` and counts frames by the pad byte of each sample, which is
-    always 0 there; the SL 3's samples are packed in 3 bytes, with no pad. A real frame equal to the mark
-    would need all six samples at `0xA5A5A5`.) A packet with no frames is left to the completion (missing
-    or errored), as is one the kernel has already marked errored in the transaction list, which it updates
-    in our array 0–2 ms after the microframe.
+  - A packet's frame count is only reported with its completion, so each buffer is filled from a template
+    before it is queued, and the early reader finds where the written part of a packet ends by counting
+    the bytes at the end of its slot that still match the template. Each 24-bit sample slot in the
+    template holds `0x7EPPPP` or `0x81PPPP`: the top byte alternates between the ends of the range from
+    channel to channel and from frame to frame, and the low 16 bits are the sample's position in the
+    buffer plus one. The top bytes stay one step in from full scale, so audio clipped at `0x7FFFFF` or
+    `0x800000` doesn't match them. A whole frame of real audio matching it would need all six channels
+    at alternating near-full-scale values, at the exact values for that position; silence, ordinary
+    audio, clipping and test tones don't come near. (Simulated: silence, a sine, full-scale noise and a
+    clipped square wave, 200 000 packets each, gave no miscounts; full-scale noise put 0.3% of packets
+    on the off-boundary path.) The SL 2 marks with `0xFF` and counts frames by the pad byte of each
+    sample, which is always 0 there; the SL 3's samples are packed in 3 bytes, with no pad.
+  - If the written part ends on a frame boundary, that is the frame count. If not (a frame caught
+    part-written, or the last frame's last bytes happen to match the template, which takes a channel-6
+    sample just short of full scale), the packet is counted from the kernel's `completeCount` if the
+    kernel has filled it in, or left to the completion. A packet
+    with no frames is left to the completion (missing or errored), as is one the kernel has already marked
+    errored in the transaction list, which it updates in our array 0–2 ms after the microframe, or one
+    whose `completeCount` disagrees with the template.
   - The early reader starts from the completions' progress (the next USB frame, and the timeline position
     of its first frame) and places frames where the completion will. The completion stays in charge: it
     writes the same frames again and keeps the clock tracking, steering, meters and silence fills. If it
@@ -442,7 +452,7 @@ setting or early read (44), and the heartbeat below.
    - Cause: the SL 2 counts arrived frames by each sample's pad byte, always 0 in its 4-byte samples; the SL 3's
      are packed in 3 bytes.
    - Fix: buffers filled with `0xA5`; a slot still all mark hasn't arrived; the last frame counts once its last
-     sample no longer reads as the mark.
+     sample no longer reads as the mark. (Replaced by a position template: 15.)
    - Test: `make hwtest`: "early capture read working", and *(debug)* "early capture read" (a 20 ms stall, no gap).
    - In the commit that rebuilt the driver.
 4. **Sl3Api's exports didn't match Rane's.**
@@ -471,7 +481,8 @@ setting or early read (44), and the heartbeat below.
    with no strings).
    - Fix: a removal keeps boot mode if the attached box's version is the loader's. Found in review. `7449d64`.
 10. **The early read could take a frame whose last sample was part-written.**
-    - Fix: the frame's last byte (its last sample's top byte) decides. Found in review. `0d6cf1b`.
+    - Fix: the frame's last byte (its last sample's top byte) decides. Found in review. `0d6cf1b`. (Covered
+      by the template since 15: a part-written frame ends off a frame boundary.)
 11. **Sl3Api deadlocked if a callback called back into it** (callbacks ran with its lock held).
     - Fix: callbacks are called outside the lock. Found in review. `10edc3d`.
 12. **After a Mac sleep the decks were on USB audio and the box at 44.1 kHz** (firmware 2.31's DSP boot).
@@ -485,6 +496,16 @@ setting or early read (44), and the heartbeat below.
       `5fd6505`.
 14. **The status kept a deck's old thru state when a client switched it** (2.31 has no `0x39` report).
     - Fix: the driver's status follows a client's accepted `0x33`. `43bc298`.
+15. **The early read's single-byte mark could match real audio.**
+    - Cause: a frame was taken as unwritten when all 18 bytes read `0xA5`, and the last frame counted once its
+      last byte didn't. A channel-6 sample with top byte `0xA5` (a loud negative sample, about 1 in 256 of
+      loud audio) left the packet to the completion; a frame with all six samples at `0xA5A5A5` would have been
+      skipped. Found in review, discussing the mark's blind spots.
+    - Fix: a per-position template (alternating `0x7E`/`0x81` top bytes, the position in the low 16 bits),
+      the written length found where it stops matching, and the kernel's `completeCount` when that falls off
+      a frame boundary. The debug log counts both off-boundary outcomes.
+    - Test: `make hwtest` *(debug)*: "early capture read", "early capture read working"; the debug log's
+      "early read" line shows frames placed early and the off-boundary counts.
 
 ## Testing
 

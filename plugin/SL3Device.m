@@ -1213,12 +1213,20 @@ static _Atomic uint64_t g_cap_head;     /* timeline position just past the last 
  * microframe, and the input safety offset only has to cover that, not the completion delay.
  *
  * - How many frames a packet carried is only reported with its completion. So every buffer is
- *   filled with CAP_MARK bytes before it is queued, and a frame slot whose 18 bytes still all read
- *   CAP_MARK has not been written. (The SL 3's samples are packed 24-bit, with no pad byte that is
- *   always 0, c.f. the SL 2: a real frame equal to the mark would need all six samples at
- *   0xA5A5A5, which audio doesn't produce.) The frames before the first unwritten slot are the
- *   ones that arrived; the last of them counts only once its last byte no longer reads as the mark
- *   either, so a frame caught part-written is left to the completion.
+ *   filled from a template (g_cap_fill) before it is queued, and the early reader counts how many
+ *   bytes at the end of a packet's slot still match it. In the template, each 24-bit sample slot
+ *   holds 0x7EPPPP or 0x81PPPP: the top byte alternates between the two ends of the range from one
+ *   channel to the next and from one frame to the next, and the low 16 bits are the sample's
+ *   position in the buffer, plus one. The top bytes stay one step in from full scale, so audio
+ *   clipped at 0x7FFFFF or 0x800000 doesn't match them. The SL 3's samples are packed, with no pad
+ *   byte that is always 0 (c.f. the SL 2), so the mark has to be something audio doesn't produce:
+ *   a whole frame matching it would need every channel at alternating near-full-scale values, at
+ *   the exact values for that position. Silence, ordinary audio, clipping and test tones don't.
+ * - The written part of a packet ends where the template stops matching. If that is on a frame
+ *   boundary, that is the frame count. If not (a frame caught part-written, or the last frame's last
+ *   bytes happen to match the template, which takes a channel-6 sample just short of full scale),
+ *   the packet is counted from the kernel's completeCount if the kernel has already filled it in,
+ *   and is otherwise left to the completion.
  * - A packet is read only once its microframe has been over for CAP_SETTLE_UF microframes (one can
  *   be caught part-written during its microframe), and not if the kernel has already marked it
  *   errored in the transaction list.
@@ -1235,10 +1243,10 @@ static _Atomic uint64_t g_cap_head;     /* timeline position just past the last 
  *   its next frame. The early reader checks the tag before and after reading a packet, converting
  *   into a scratch buffer in between, so it never puts a refilled buffer's contents in the ring.
  * ---------------------------------------------------------------------------- */
-#define CAP_MARK       0xA5        /* fills a capture buffer before it is queued: see above */
 #define CAP_SETTLE_UF  1           /* microframes after a packet's own before it is read early */
 #define CAP_MAP_N      128         /* USB frame -> transfer map entries: power of two, >= 2 x CAP_NXF */
 static uint8_t *g_cap_bytes[CAP_NXF];             /* the capture buffers' bytes, for the IO thread */
+static uint8_t  g_cap_fill[CAP_PKTS * PKT_MAX];   /* fills a capture buffer before it is queued: see above */
 static _Atomic uint64_t g_cap_tag[CAP_NXF];       /* USB frame the buffer holds, 0 while refilled */
 static _Atomic int      g_cap_idx_of[CAP_MAP_N];  /* the transfer queued for USB frame f, at [f % CAP_MAP_N] */
 /* The completions' progress (g_q writes, the IO thread reads; seqlock): the next USB frame to
@@ -1271,21 +1279,26 @@ static _Atomic uint64_t g_in_dropouts;            /* IO cycles in which some inp
                                                      box connected, or the input safety offset changed (dropouts at
                                                      another offset say nothing about this one) */
 #if SL3_DEBUG
-static _Atomic uint32_t dbg_er_restarts, dbg_er_torn, dbg_er_cc_differs, dbg_er_errored;
+static _Atomic uint32_t dbg_er_restarts, dbg_er_refilled, dbg_er_cc_differs, dbg_er_errored;
+static _Atomic uint32_t dbg_er_by_kernel_count;   /* the template matched off a frame boundary: counted by completeCount */
+static _Atomic uint32_t dbg_er_left;              /* ... with no completeCount yet: left to the completion */
 static _Atomic uint64_t dbg_rd_early, dbg_rd_short;   /* ReadInput, after the first capture */
 static _Atomic int64_t  dbg_rd_margin_min;        /* frames between the read's end and the head, least */
 static void dbg_er_reset(void) {
-    dbg_er_restarts = dbg_er_torn = dbg_er_cc_differs = dbg_er_errored = 0;
+    dbg_er_restarts = dbg_er_refilled = dbg_er_cc_differs = dbg_er_errored = 0;
+    dbg_er_by_kernel_count = dbg_er_left = 0;
     dbg_rd_early = dbg_rd_short = 0;
     dbg_rd_margin_min = INT64_MAX;
 }
 static void dbg_er_log(const char *what) {
     int64_t m = atomic_load(&dbg_rd_margin_min);
-    DBG_LOG("DBG early read %{public}s: frames placed early %llu, restarts %u, torn %u, errored %u, count "
-        "differs %u | completion found %llu different | ReadInput frames %llu: only there early %llu, "
+    DBG_LOG("DBG early read %{public}s: frames placed early %llu, restarts %u, refilled while read %u, "
+        "errored %u, count differs %u, off-boundary by kernel count %u, off-boundary left %u | completion "
+        "found %llu different | ReadInput frames %llu: only there early %llu, "
         "SILENCE (not captured yet) %llu | least margin %.2f ms",
-        what, atomic_load(&g_er_placed), atomic_load(&dbg_er_restarts), atomic_load(&dbg_er_torn),
-        atomic_load(&dbg_er_errored), atomic_load(&dbg_er_cc_differs), g_er_differ,
+        what, atomic_load(&g_er_placed), atomic_load(&dbg_er_restarts), atomic_load(&dbg_er_refilled),
+        atomic_load(&dbg_er_errored), atomic_load(&dbg_er_cc_differs),
+        atomic_load(&dbg_er_by_kernel_count), atomic_load(&dbg_er_left), g_er_differ,
         atomic_load(&g_rd_frames), atomic_load(&dbg_rd_early), atomic_load(&dbg_rd_short),
         m == INT64_MAX ? 0.0 : 1000.0 * (double)m / g_sr);
 }
@@ -1306,11 +1319,25 @@ static inline void cap_frame_to_float_live(const volatile uint8_t *q, float *fr)
     }
 }
 
-/* A frame slot of a queued capture buffer that the controller hasn't written: every byte is still
-   CAP_MARK (see "Early read"). */
-static inline bool cap_slot_unwritten(const volatile uint8_t *q) {
-    for (int i = 0; i < FRAME_BYTES; i++) if (q[i] != CAP_MARK) return false;
-    return true;
+/* Build the capture fill template (see "Early read"): per 24-bit sample slot, little-endian, the
+   low 16 bits are its position in the buffer plus one, and the top byte is 0x7E or 0x81, alternating
+   by channel and by frame. */
+static void cap_fill_init(void) {
+    for (int s = 0; s < CAP_PKTS * PKT_MAX / SAMPLE_BYTES; s++) {
+        int frame = s / NCH, ch = s % NCH;
+        uint16_t pos = (uint16_t)(s + 1);
+        g_cap_fill[s * 3]     = (uint8_t)pos;
+        g_cap_fill[s * 3 + 1] = (uint8_t)(pos >> 8);
+        g_cap_fill[s * 3 + 2] = ((ch + frame) & 1) ? 0x81 : 0x7E;
+    }
+}
+
+/* How many bytes of a queued capture packet the controller has written: the slot's length less the
+   bytes at its end that still match the fill template (see "Early read"). */
+static inline int cap_written_bytes(const volatile uint8_t *p, const uint8_t *fill) {
+    int end = PKT_MAX;
+    while (end > 0 && p[end - 1] == fill[end - 1]) end--;
+    return end;
 }
 
 /* The completions' progress (g_q). */
@@ -1391,20 +1418,22 @@ static void cap_read_early(void) {
             DBG_DO(atomic_fetch_add_explicit(&dbg_er_errored, 1, memory_order_relaxed));
             break;
         }
-        /* Count the frames that arrived by the marks: the slots before the first one still all
-           CAP_MARK. None means missing or errored. If the last of them still has its last byte
-           reading as the mark, it may be caught part-way through being written (or, 1 time in 256,
-           be real audio with that byte): leave the packet to the completion. The settle time
+        /* Count the frames that arrived from where the fill template stops matching. Off a frame
+           boundary, take the kernel's count if it has one that covers the written bytes, or leave
+           the packet to the completion. None means missing or errored. The settle time
            (CAP_SETTLE_UF) is what keeps the early reader clear of a packet still being written. */
         const volatile uint8_t *p = g_cap_bytes[idx] + k * PKT_MAX;
-        int n = 0;
-        while (n < PKT_MAX / FRAME_BYTES && !cap_slot_unwritten(p + n * FRAME_BYTES)) n++;
-        if (n == 0) break;
-        const volatile uint8_t *last = p + n * FRAME_BYTES - 1;   /* the frame's last byte */
-        if (*last == CAP_MARK) {
-            DBG_DO(atomic_fetch_add_explicit(&dbg_er_torn, 1, memory_order_relaxed));
-            break;
+        int end = cap_written_bytes(p, g_cap_fill + k * PKT_MAX);
+        int n = end / FRAME_BYTES;
+        if (end % FRAME_BYTES) {
+            if (!cc || cc % FRAME_BYTES || (int)cc < end) {
+                DBG_DO(atomic_fetch_add_explicit(&dbg_er_left, 1, memory_order_relaxed));
+                break;
+            }
+            n = (int)(cc / FRAME_BYTES);
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_by_kernel_count, 1, memory_order_relaxed));
         }
+        if (n == 0) break;
         if (cc && (int)(cc / FRAME_BYTES) != n) {   /* the kernel's count disagrees: let the completion decide */
             DBG_DO(atomic_fetch_add_explicit(&dbg_er_cc_differs, 1, memory_order_relaxed));
             break;
@@ -1413,7 +1442,7 @@ static void cap_read_early(void) {
         /* Still frame f's buffer, not refilled while we read it? */
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&g_cap_tag[idx], memory_order_relaxed) != f) {
-            DBG_DO(atomic_fetch_add_explicit(&dbg_er_torn, 1, memory_order_relaxed));
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_refilled, 1, memory_order_relaxed));
             break;
         }
         /* Into the ring, where the completion will put them too. */
@@ -1608,7 +1637,7 @@ static void cap_submit(int idx, uint32_t gen) {
            as not arrived, and ask for one full-size packet per microframe. */
         atomic_store_explicit(&g_cap_tag[idx], 0, memory_order_relaxed);
         atomic_thread_fence(memory_order_release);
-        memset(g_cap_bytes[idx], CAP_MARK, CAP_PKTS * PKT_MAX);
+        memcpy(g_cap_bytes[idx], g_cap_fill, CAP_PKTS * PKT_MAX);
         IOUSBHostIsochronousTransaction *tx = g_cap_xf[idx].tx;
         for (int k = 0; k < CAP_PKTS; k++)
             tx[k] = (IOUSBHostIsochronousTransaction){ .requestCount = PKT_MAX, .offset = (uint32_t)(k * PKT_MAX) };
@@ -1849,6 +1878,7 @@ static bool usb_open_all(void) {
         usb_release_audio();
         return false;
     }
+    cap_fill_init();
     for (int i = 0; i < CAP_NXF; i++) {
         if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
         if (!g_cap_xf[i].tx)  g_cap_xf[i].tx  = calloc(CAP_PKTS, sizeof(IOUSBHostIsochronousTransaction));
