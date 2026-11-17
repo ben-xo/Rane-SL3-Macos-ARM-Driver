@@ -2,13 +2,15 @@
 /*
  * sl3flash — write the Rane SL 3's firmware into its boot EEPROM over USB.
  *
- *   sl3flash [--firmware DIR] [--force] [--dry-run] [--wait SECONDS]
+ *   sl3flash [--firmware DIR] [--force] [--dry-run] [--wait SECONDS] [--blank-fx2]
  *     --firmware DIR  directory holding the firmware images (*.bin, recognised by content);
  *                     default: /Library/Audio/Plug-Ins/HAL/SL3Device.firmware
  *     --force         rewrite the EEPROM even if it already holds the image
  *     --dry-run       check the images and the box (and compare its EEPROM with the image)
  *                     without changing anything
  *     --wait SECONDS  wait up to this long for a box to be connected
+ *     --blank-fx2     also take a Cypress FX2 with a blank EEPROM (04b4:8613) as the SL 3: any
+ *                     other device built on a blank FX2 (a logic analyser, say) shows up the same
  *
  *   Exit status: 0 done, or nothing to do; 1 failed; 2 bad arguments; 3 (--dry-run only) the
  *   box needs writing.
@@ -351,14 +353,15 @@ static bool finalize(AudioObjectID hal, const uint8_t *final_hdr) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     const char *dir = kDefaultDir;
-    bool dry = false, force = false;
+    bool dry = false, force = false, blank_ok = false;
     int waitsecs = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dry-run")) dry = true;
         else if (!strcmp(argv[i], "--force")) force = true;
         else if (!strcmp(argv[i], "--firmware") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--wait") && i + 1 < argc) waitsecs = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--firmware DIR] [--force] [--dry-run] [--wait SECONDS]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--blank-fx2")) blank_ok = true;
+        else { fprintf(stderr, "usage: %s [--firmware DIR] [--force] [--dry-run] [--wait SECONDS] [--blank-fx2]\n", argv[0]); return 2; }
     }
 
     image_t final = {0}, boot = {0};
@@ -375,6 +378,12 @@ int main(int argc, char **argv) {
     for (int i = 0; ; i++) {
         n = find_boxes(b, 4);
         if (n > 1) { printf("%d SL 3s (or blank FX2s) are connected; connect only the one to flash\n", n); release_boxes(b, n); return 1; }
+        if (n == 1 && b[0].vid == FX2_DEFAULT_VID && !blank_ok) {
+            printf("a Cypress FX2 with a blank EEPROM (04b4:8613) is connected. It may be an SL 3 whose EEPROM is\n"
+                   "blank, or any other device built on an FX2: if you are sure it is the SL 3, run again with --blank-fx2\n");
+            release_boxes(b, n);
+            return 1;
+        }
         if (n == 1 && !b[0].firmware) break;
         hal = sl3h_find_device();
         if (n == 1 && hal != kAudioObjectUnknown && sl3h_version(hal, &maj, &min)) { running = true; break; }
